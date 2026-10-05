@@ -373,6 +373,24 @@ export function effectivePrices(prices: Prices, usage?: RealUsage, paidUsd?: num
   return { ...scalePrices(prices, usage, paidUsd), derived: true };
 }
 
+/** Model prices are quoted in cents per million tokens — that is how cheap they are. */
+export function fmtCentsPerMillion(usdPerMillion: number): string {
+  const c = usdPerMillion * 100;
+  return `${c < 10 ? c.toFixed(2) : c.toFixed(1)} ¢/M`;
+}
+
+/** A cost as cents, for figures where dollars hide the scale. */
+export function fmtCents(usd: number): string {
+  return `${(usd * 100).toFixed(2)} ¢`;
+}
+
+/** Money the way these amounts are actually read: under a dime is cents. */
+export function fmtMoney(usd: number): string {
+  if (!Number.isFinite(usd)) return "—";
+  if (usd === 0) return "$0";
+  return Math.abs(usd) < 0.1 ? fmtCents(usd) : formatUsd(usd);
+}
+
 export interface CostSide {
   /** tokens billed at the fresh input price */
   fresh: number;
@@ -615,13 +633,15 @@ export function statsLines(snapshot: ChatSnapshot, g: Gains, o: StatsOptions): s
   out.push("## Cost (estimate, USD)");
   out.push("  the same session with every turn carrying the whole log vs what it really cost");
   out.push(`  ${pad("", 20)}${pad("full transcript", 20)}optchat · paid`);
-  out.push(`  ${pad("last turn", 20)}${pad(formatUsd(c.perTurn.withoutUsd), 20)}${formatUsd(c.perTurn.withUsd)}`);
-  out.push(`  ${pad("whole session", 20)}${pad(formatUsd(c.without.usd), 20)}${formatUsd(c.with.usd)}`);
-  out.push(`  ${pad("saved", 20)}${formatUsd(c.savedUsd)}  (${c.savedPct.toFixed(0)}% less)`);
+  out.push(`  ${pad("last turn", 20)}${pad(fmtMoney(c.perTurn.withoutUsd), 20)}${fmtMoney(c.perTurn.withUsd)}`);
+  out.push(`  ${pad("whole session", 20)}${pad(fmtMoney(c.without.usd), 20)}${fmtMoney(c.with.usd)}`);
+  const perReq = (usd: number) => fmtCents(usd / Math.max(1, c.requests));
+  out.push(`  ${pad("per request", 20)}${pad(perReq(c.without.usd), 20)}${perReq(c.with.usd)}`);
+  out.push(`  ${pad("saved", 20)}${fmtMoney(c.savedUsd)}  (${c.savedPct.toFixed(0)}% less)`);
   out.push(
     line(
       "prices",
-      `${formatUsd(c.prices.input)}/M in · ${formatUsd(c.prices.cacheRead)}/M cache read · ${formatUsd(c.prices.output)}/M out`,
+      `${fmtCentsPerMillion(c.prices.input)} in · ${fmtCentsPerMillion(c.prices.cacheRead)} cache read · ${fmtCentsPerMillion(c.prices.output)} out`,
       "",
     ),
   );
@@ -667,7 +687,14 @@ export function statsLines(snapshot: ChatSnapshot, g: Gains, o: StatsOptions): s
     out.push(line("requests", String(u.requests), ""));
     out.push(line("tokens", `in ${fmtTokens(u.totals.input)} · cache read ${fmtTokens(u.totals.cache)} · out ${fmtTokens(u.totals.output)}`, ""));
     out.push(line("last request", `in ${fmtTokens(u.last.input)} · cache ${fmtTokens(u.last.cache)} · out ${fmtTokens(u.last.output)}`, ""));
-    if (typeof o.paidUsd === "number") out.push(line("paid", formatUsd(o.paidUsd), "counted by OpenCode for this session"));
+    if (typeof o.paidUsd === "number")
+      out.push(
+        line(
+          "paid",
+          `${fmtMoney(o.paidUsd)}  (${fmtCents(o.paidUsd / Math.max(1, u.requests))} a request)`,
+          "counted by OpenCode for this session",
+        ),
+      );
   }
   return out;
 }

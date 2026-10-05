@@ -453,3 +453,33 @@ describe("cost wording", () => {
     expect(c.with.usd).toBeCloseTo(0.02, 6);
   });
 });
+
+describe("units", () => {
+  test("prices read in cents per million, costs per request in cents", () => {
+    expect(St.fmtCentsPerMillion(0.0552)).toBe("5.52 ¢/M");
+    expect(St.fmtCentsPerMillion(0.11)).toBe("11.0 ¢/M");
+    expect(St.fmtCentsPerMillion(0.009)).toBe("0.90 ¢/M");
+    expect(St.fmtCents(0.0016)).toBe("0.16 ¢");
+    expect(St.fmtCents(0.011)).toBe("1.10 ¢");
+    expect(St.fmtMoney(0.0016)).toBe("0.16 ¢");
+    expect(St.fmtMoney(0.586)).toBe("$0.586");
+    expect(St.fmtMoney(4.04)).toBe("$4.04");
+    expect(St.fmtMoney(0)).toBe("$0");
+  });
+
+  test("the cost block shows a per-request line and cents per million", async () => {
+    const dir = join(home, "ses_u");
+    await fs.mkdir(join(dir, "main"), { recursive: true });
+    const rows = [
+      { i: 0, kind: "user", text: "u" + "x".repeat(4000) },
+      { i: 1, kind: "talk", text: "t" + "x".repeat(4000) },
+    ].map((r) => ({ ...r, size: C.byteLen(`${r.kind}: ${r.text}`), date: "2026-10-05" }));
+    await fs.writeFile(join(dir, "main", "2026-10-05.jsonl"), rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const loaded = await St.loadChatDir(dir, 1_000);
+    const g = St.gains("ses_u", loaded, loaded.rows, 1.3);
+    const text = St.statsLines(loaded.snapshot, g, { ratio: 1.3, budget: 1_000, prices: St.DEFAULT_PRICES }).join("\n");
+    expect(text).toContain("per request");
+    expect(text).toContain("¢/M");
+    expect(text).toContain("¢");
+  });
+});
