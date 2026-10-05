@@ -361,3 +361,45 @@ describe("report lines", () => {
     expect(empty.join("\n")).toContain("No summaries yet");
   });
 });
+
+describe("inferred prices", () => {
+  test("the catalogue wins when the model is known", () => {
+    const eff = St.effectivePrices({ input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1, model: "a/b", source: "catalogue" }, undefined, 5);
+    expect(eff.derived).toBe(false);
+    expect(eff.input).toBe(1);
+  });
+
+  test("without a catalogue entry the invoice sets the scale", () => {
+    const usage: St.RealUsage = {
+      requests: 2,
+      last: { input: 500_000, cache: 5_000_000, output: 50_000 },
+      totals: { input: 1_000_000, cache: 10_000_000, output: 100_000 },
+      series: [
+        { input: 500_000, cache: 5_000_000, output: 50_000 },
+        { input: 500_000, cache: 5_000_000, output: 50_000 },
+      ],
+    };
+    const eff = St.effectivePrices(St.DEFAULT_PRICES, usage, 0.5);
+    expect(eff.derived).toBe(true);
+    expect(eff.input).toBeLessThan(St.DEFAULT_PRICES.input);
+    // the ratios are preserved, only the scale changes
+    expect(eff.cacheRead / eff.input).toBeCloseTo(St.DEFAULT_PRICES.cacheRead / St.DEFAULT_PRICES.input, 9);
+
+    const c = St.costs(
+      [
+        { full: 5_000_000, ours: 1_000_000 },
+        { full: 5_000_000, ours: 1_000_000 },
+      ],
+      { prices: St.DEFAULT_PRICES, usage, paidUsd: 0.5 },
+    );
+    // the "with optchat" column now adds up to what was really paid
+    expect(c.with.usd).toBeCloseTo(0.5, 6);
+    expect(c.savedUsd).toBeCloseTo(c.without.usd - 0.5, 6);
+    expect(c.prices.input).toBeCloseTo(eff.input, 9);
+  });
+
+  test("no invoice, no derivation", () => {
+    expect(St.effectivePrices(St.DEFAULT_PRICES, undefined, 3).derived).toBe(false);
+    expect(St.effectivePrices(St.DEFAULT_PRICES, { requests: 0, last: { input: 0, cache: 0, output: 0 }, totals: { input: 0, cache: 0, output: 0 }, series: [] }, 3).derived).toBe(false);
+  });
+});

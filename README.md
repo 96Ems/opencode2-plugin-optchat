@@ -110,10 +110,15 @@ reloads both sides, so a running TUI picks up a fix without losing the session.
 with the whole transcript, where the unchanged prefix is served from the
 provider's cache and only the new tail pays the fresh input price. The two sides
 count the same answers, so the difference isolates the effect of the context.
-Prices are read from the model catalogue (`ModelInfo.cost`, USD per million
-tokens); when the model is unknown, built-in defaults are used and the popup says
-so. The cache read price is what makes a long prefix cheap — that is why the old
-hand-entered "cache price" setting is gone: the catalogue knows it.
+
+Prices come from the model catalogue (`ModelInfo.cost`, USD per million tokens).
+When the catalogue has no entry for the model — common with custom providers —
+they are **inferred from what the session actually cost**: every request is
+re-priced with the same ratios so that the "with optchat" column adds up to the
+invoice, which keeps the counterfactual comparable (the report says which of the
+two it used). The cache read price is what makes a long prefix cheap; that is why
+the old hand-entered "cache price" setting is gone. The summaries cost extra on
+top — one small model call per node — and the report says so.
 
 ## Browsing
 

@@ -334,6 +334,38 @@ export function formatUsd(n: number): string {
   return `$${n.toFixed(2)}`;
 }
 
+export interface EffectivePrices extends Prices {
+  /** true when the prices were inferred from what the session really cost */
+  derived: boolean;
+}
+
+/**
+ * Prices to bill with. The catalogue's when it has the model, otherwise inferred
+ * from what the session actually cost: every request is re-priced with the same
+ * ratios (cache read and output expressed in input prices) so that the "with
+ * optchat" column adds up to the invoice and the counterfactual stays comparable.
+ */
+export function effectivePrices(prices: Prices, usage?: RealUsage, paidUsd?: number): EffectivePrices {
+  const plain: EffectivePrices = { ...prices, derived: false };
+  if (prices.source === "catalogue" || !usage || usage.requests === 0) return plain;
+  if (typeof paidUsd !== "number" || !(paidUsd > 0) || !(prices.input > 0)) return plain;
+  const cacheRatio = prices.cacheRead / prices.input;
+  const outputRatio = prices.output / prices.input;
+  const equivalents =
+    (usage.totals.input + cacheRatio * usage.totals.cache + outputRatio * usage.totals.output) / 1e6;
+  if (!(equivalents > 0)) return plain;
+  const scale = paidUsd / equivalents / prices.input;
+  return {
+    input: prices.input * scale,
+    output: prices.output * scale,
+    cacheRead: prices.cacheRead * scale,
+    cacheWrite: prices.cacheWrite * scale,
+    model: prices.model,
+    source: "default",
+    derived: true,
+  };
+}
+
 export interface CostSide {
   /** tokens billed at the fresh input price */
   fresh: number;
@@ -372,12 +404,11 @@ export function costs(
   series: { full: number; ours: number }[],
   opts: { prices: Prices; usage?: RealUsage; paidUsd?: number; windowTokens?: number },
 ): CostEstimate {
-  const p = opts.prices;
-  const usd = (fresh: number, cached: number, output: number) =>
-    (fresh / 1e6) * p.input + (cached / 1e6) * p.cacheRead + (output / 1e6) * p.output;
-
   const usage = opts.usage && opts.usage.series.length === series.length ? opts.usage : undefined;
   const measured = Boolean(usage);
+  const p = effectivePrices(opts.prices, measured ? usage : undefined, opts.paidUsd);
+  const usd = (fresh: number, cached: number, output: number) =>
+    (fresh / 1e6) * p.input + (cached / 1e6) * p.cacheRead + (output / 1e6) * p.output;
 
   const without: CostSide = { fresh: 0, cached: 0, output: 0, usd: 0 };
   const side: CostSide = { fresh: 0, cached: 0, output: 0, usd: 0 };
@@ -556,10 +587,22 @@ export function statsLines(snapshot: ChatSnapshot, g: Gains, o: StatsOptions): s
   out.push(`  ${pad("whole session", 20)}${pad(formatUsd(c.without.usd), 20)}${formatUsd(c.with.usd)}`);
   out.push(`  ${pad("saved", 20)}${formatUsd(c.savedUsd)}  (${c.savedPct.toFixed(0)}% less)`);
   out.push(line("prices", `${formatUsd(c.prices.input)}/M in · ${formatUsd(c.prices.cacheRead)}/M cache read · ${formatUsd(c.prices.output)}/M out`, ""));
-  out.push(line("model", c.prices.model || "(unknown)", c.prices.source === "catalogue" ? "from the model catalogue" : "built-in default prices"));
+  const eff = effectivePrices(o.prices, o.usage, o.paidUsd);
+  out.push(
+    line(
+      "model",
+      c.prices.model || "(unknown)",
+      eff.derived
+        ? `prices inferred from the ${formatUsd(o.paidUsd ?? 0)} this session cost`
+        : c.prices.source === "catalogue"
+          ? "prices from the model catalogue"
+          : "built-in default prices (no catalogue entry)",
+    ),
+  );
   out.push(line("method", "unchanged prefix cached", ""));
   out.push("        every request bills the new tail fresh and serves the prefix from the cache;");
   out.push("        answers count the same on both sides, so the gap is the size of the context.");
+  out.push("        the summaries themselves cost extra: one small call per summary node.");
   if (c.overWindow > 0 && o.windowTokens) {
     const w = fmtTokens(o.windowTokens);
     out.push(`⚠  ${c.overWindow} of ${c.requests} requests would not have fit the ${w} token window without optchat`);
