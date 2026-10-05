@@ -37,12 +37,40 @@ type AnyRec = Record<string, any>;
  * one's rewrite of the outgoing messages wins at random.
  */
 const OWNERS_KEY = "__optchatChatOwners";
-function owners(): Map<string, string> {
+/** A chat is lent to one instance at a time; the lease frees it if that instance stops. */
+const LEASE_MS = 90_000;
+
+interface OwnerLease {
+  inst: string;
+  seen: number;
+}
+
+function owners(): Map<string, OwnerLease> {
   const scope = globalThis as unknown as Record<string, unknown>;
-  if (scope[OWNERS_KEY] instanceof Map) return scope[OWNERS_KEY] as Map<string, string>;
-  const map = new Map<string, string>();
+  if (scope[OWNERS_KEY] instanceof Map) return scope[OWNERS_KEY] as Map<string, OwnerLease>;
+  const map = new Map<string, OwnerLease>();
   scope[OWNERS_KEY] = map;
   return map;
+}
+
+/** Claim a chat, or take it over when the current owner's lease expired (e.g. after a reload). */
+function claim(dir: string, inst: string): { owned: boolean; tookOver: boolean } {
+  const current = owners().get(dir);
+  if (current && current.inst !== inst && Date.now() - current.seen <= LEASE_MS) {
+    return { owned: false, tookOver: false };
+  }
+  const tookOver = current !== undefined && current.inst !== inst;
+  owners().set(dir, { inst, seen: Date.now() });
+  return { owned: true, tookOver };
+}
+
+function isOwner(dir: string, inst: string): boolean {
+  return owners().get(dir)?.inst === inst;
+}
+
+function holdLease(dir: string, inst: string): void {
+  const map = owners();
+  if (map.get(dir)?.inst === inst) map.set(dir, { inst, seen: Date.now() });
 }
 
 const JOBS = 8;
@@ -255,10 +283,7 @@ export default {
         const dir = join(dataDir, sessionID.replace(/[^\w.-]/g, "_"));
         await fs.mkdir(dir, { recursive: true });
         const lockHeld = await acquireLock(dir);
-        const registry = owners();
-        const owner = registry.get(dir);
-        const owned = owner === undefined || owner === INSTANCE;
-        if (owned) registry.set(dir, INSTANCE);
+        const { owned, tookOver } = claim(dir, INSTANCE);
         const chat: Chat = {
           sessionID,
           dir,
@@ -277,6 +302,7 @@ export default {
         };
         if (!lockHeld) await logLine(chat, `WARNING another process holds the lock on ${dir}`);
         if (!owned) await logLine(chat, `another optchat instance in this process owns ${dir}: standing down`);
+        else if (tookOver) await logLine(chat, "took over a stale lease (the plugin was reloaded?)");
 
         const seen = new Set<string>();
         for (const line of await listJsonl(join(dir, "main"))) {
@@ -520,7 +546,12 @@ export default {
             ? { providerID: String(model.providerID), id: String(model.id) }
             : undefined,
         );
-        if (!chat.owned) return; // another instance in this process serves this session
+        // ownership can move between instances in this process (e.g. after a reload)
+        if (!chat.owned || !isOwner(chat.dir, INSTANCE)) {
+          chat.owned = false;
+          return;
+        }
+        holdLease(chat.dir, INSTANCE);
 
         const newTurn = messages[messages.length - 1]?.role === "user";
         if (newTurn) {
@@ -560,7 +591,7 @@ export default {
       try {
         if (disabled) return;
         const chat = await getChat(String(event.sessionID));
-        if (!chat.owned) return;
+        if (!chat.owned || !isOwner(chat.dir, INSTANCE)) return;
         await ingest(chat, Array.isArray(event.messages) ? event.messages : []);
         event.result = { summary: C.renderView(chat.state, "line") };
       } catch (err) {
@@ -618,7 +649,7 @@ export default {
       for (const promise of chats.values()) {
         const chat = await promise.catch(() => undefined);
         if (!chat) continue;
-        if (chat.owned && owners().get(chat.dir) === INSTANCE) owners().delete(chat.dir);
+        if (chat.owned && isOwner(chat.dir, INSTANCE)) owners().delete(chat.dir);
         for (const handle of Object.values(chat.handles)) await handle?.fh.close().catch(() => {});
       }
       for (const path of locks) await fs.rm(path, { force: true }).catch(() => {});
