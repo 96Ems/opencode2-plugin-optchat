@@ -130,5 +130,5 @@ export function parseModel(ref: string | undefined): { providerID: string; id: s
 }
 
 export function formatModel(ref: string): string {
-  return ref || "(modèle de la session)";
+  return ref || "(the session's model)";
 }

@@ -236,7 +236,7 @@ export function unsummarizedLine(state: ChatState, i: number, cap = NODE): strin
   return `${oneLine(head)}${marker}${oneLine(tail)}`;
 }
 
-function partText(state: ChatState, part: Part, mode: "placeholder" | "line"): string {
+export function partText(state: ChatState, part: Part, mode: "placeholder" | "line"): string {
   const text = nodeText(state, part.l, part.i);
   if (text !== undefined) return oneLine(text);
   if (mode === "line" && part.l === 0) return unsummarizedLine(state, part.i);

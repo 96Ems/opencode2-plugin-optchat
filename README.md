@@ -30,9 +30,9 @@ git clone https://github.com/96Ems/opencode2-plugin-optchat.git ~/.config/openco
 ```
 
 No config edit, no npm dependency: the plugin imports nothing but Node builtins
-plus its own `./core.ts`. (Measured on opencode 2.0.22: the `plugin: [...]`
-array of `opencode.json(c)` did not load a local file in this build, while
-`<plugins-dir>/<name>/index.ts` does.)
+plus its own `./core.ts`. (Measured on opencode **2.0.22 and 2.0.23**: the
+`plugin: [...]` array of `opencode.json(c)` does not load a local file in these
+builds, while `<plugins-dir>/<name>/index.ts` does.)
 
 ### Options
 
@@ -64,27 +64,56 @@ at load; the log is history and is never edited.
 
 ## TUI plugin — popup and widget
 
-Load it with the rest of the plugin directory (same folder: `index.ts` is the
-server side, `tui.ts` the CLI side — both are picked up automatically).
+The same directory carries both sides: `index.ts` is the server plugin and
+`tui.ts` the CLI one (a one-line re-export of `tui-view.tsx`), so a single
+install gives you the popup too.
 
-- **`/optchat`** ouvre un popup navigable (↑/↓ puis Entrée, taper pour filtrer,
-  Échap pour fermer) :
-  - **Stats de la session** — transcript vs vue, compression, historique porté à
-    chaque tour (×N), tokens réels (`in` / `cache` / `out`) tels que le provider
-    les facture ;
-  - **Vue** — exactement la chaîne envoyée au modèle ce tour-là ;
-  - **Arbre** — les résumés par niveau, avec la plage de messages et la taille ;
-  - **Réglages** — activer/désactiver, modèle de compaction (liste des modèles du
-    projet), budget de vue, cap par résultat d'outil, ratio octets/token, prix du
-    cache.
-- **widget de barre latérale** : `optchat · N msg · vue X Ko · ×Y` (et
-  `· Z en attente` quand le compacteur a du retard).
-- Raccourcis directs : `/optchat stats`, `/optchat view`, `/optchat tree`,
-  `/optchat settings`, `/optchat on`, `/optchat off`.
+**`/optchat`** opens a navigable popup (↑/↓ then Enter, type to filter, Esc to
+close):
 
-Les réglages sont écrits dans `<dataDir>/settings.json` ; le plugin serveur
-relit ce fichier **à chaque tour** (un `stat()`), donc un changement depuis le
-popup s'applique au message suivant — sans redémarrer le service.
+- **Stats** — the session at a glance, then the context carried per turn and what
+  it costs:
+  - transcript vs context sent, compression factor, budget bar;
+  - context carried by every request, without optchat vs with it, at 0/25/50/75/100 %
+    of the session plus last turn and session totals, each with its own bar;
+  - **cost in USD** the same way round: last turn and whole session, with the
+    **saving**, the prices used (input / cache read / output per million tokens)
+    and their source (the model catalogue, i.e. `ModelInfo.cost`);
+  - the provider's own numbers (`tokens.in`, `tokens.cache.read`, `tokens.out`,
+    and `session.cost`) for the "with optchat" side and for what was really paid;
+  - a warning when the counterfactual would not have fitted the model window.
+- **View** — one line per part: id, kind, size, whether it is carried whole or
+  cut, and a preview. Originals are bright, summaries sit on a grey ramp by level
+  (L1 light → L5 dark), and a cut part shows the `zoom(start, count)` that
+  recovers it. This replaces reading the raw context string.
+- **Summaries** — the tree: how many nodes per level and what each node covers.
+- **Settings** — memory on/off, compactor model (picked from the catalogue),
+  context budget, tool result cap, bytes per token, and where the file lives.
+- **Raw context string** — the exact text sent to the model, if you want it.
+
+The sidebar shows `optchat · 918 msgs · view 127 KB · ×11.4` (plus
+`· 37 waiting` while the compactor catches up).
+
+Direct shortcuts: `/optchat_stats`, `/optchat_view`, `/optchat_tree`,
+`/optchat_raw`, `/optchat_settings`, `/optchat_on`, `/optchat_off`; `/oc` is an
+alias of `/optchat`.
+
+Settings are written to `<dataDir>/settings.json`; the server plugin re-reads
+that file **on every turn** (one `stat()`), so a change made in the popup applies
+to the next message — no restart. Copying files into the plugin directory hot
+reloads both sides, so a running TUI picks up a fix without losing the session.
+
+### How the money numbers are computed
+
+`stats.ts` bills each request twice: once with the context optchat actually sent
+(using the provider's own token counts when the session carries them) and once
+with the whole transcript, where the unchanged prefix is served from the
+provider's cache and only the new tail pays the fresh input price. The two sides
+count the same answers, so the difference isolates the effect of the context.
+Prices are read from the model catalogue (`ModelInfo.cost`, USD per million
+tokens); when the model is unknown, built-in defaults are used and the popup says
+so. The cache read price is what makes a long prefix cheap — that is why the old
+hand-entered "cache price" setting is gone: the catalogue knows it.
 
 ## Browsing
 
@@ -147,9 +176,12 @@ settled        true
 bun test
 ```
 
-19 tests over the pure core (`plugins/optchat-core.ts`): byte handling, free
-nodes, in-order compaction, the fold (budget, tiling, monotonicity), zoom,
-prompt assembly, message decomposition and capping.
+37 tests, all pure (no network, no model): `test/core.test.ts` covers byte
+handling, free nodes, in-order compaction, the fold (budget, tiling,
+monotonicity), zoom, prompt assembly, message decomposition and capping;
+`test/settings.test.ts` covers the settings file, the shared dirs, the cost
+model, the bars and the report lines. `bin/measure.ts` prints the same numbers
+for a chat from the command line.
 
 ## License
 

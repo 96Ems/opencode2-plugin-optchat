@@ -1,16 +1,16 @@
 /** @jsxImportSource @opentui/solid */
 /**
- * optchat TUI — popup navigable + widget de barre latérale.
+ * optchat TUI — navigable popup and sidebar widget.
  *
- * `/optchat`            ouvre le menu (↑/↓ puis Entrée ; taper filtre)
- *   ├ Stats de la session   gain réel vs transcript complet, cache, tokens
- *   ├ Vue                   exactement ce que le modèle reçoit
- *   ├ Arbre                 les résumés, par niveau
- *   └ Réglages              activer/désactiver, modèle de compaction, budget
- *                           de vue, ratio, prix du cache
+ * `/optchat`           opens the menu (↑/↓ then Enter, type to filter)
+ *   ├ Stats            session, context carried per turn, cost with/without optchat
+ *   ├ View             exactly what the model receives, one line per part
+ *   ├ Summaries        the summary tree, level by level
+ *   └ Settings         on/off, compactor model, context budget, tool result cap
  *
- * Il lit le même dossier de chat que le plugin serveur (aucun appel à lui) :
- * les réglages vivent dans settings.json, que le serveur relit à chaque tour.
+ * It reads the same chat directory as the server plugin (they never call each
+ * other): settings live in settings.json, which the server re-reads every turn.
+ * Every string here is English — the plugin is meant to be shared.
  */
 import { Plugin } from "@opencode/plugin/tui";
 import { For, Show, createSignal, onCleanup, onMount } from "solid-js";
@@ -33,7 +33,7 @@ function pick(theme: AnyRec | undefined, path: string, fallback = "#cccccc"): an
   return node ?? fallback;
 }
 
-const ratio = (theme: AnyRec | undefined, kind: "ok" | "warn" | "err" | "info" | "muted" | "text"): any => {
+const ink = (theme: AnyRec | undefined, kind: "ok" | "warn" | "err" | "info" | "muted" | "text"): any => {
   switch (kind) {
     case "ok":
       return pick(theme, "text.feedback.success");
@@ -50,21 +50,46 @@ const ratio = (theme: AnyRec | undefined, kind: "ok" | "warn" | "err" | "info" |
   }
 };
 
+/** Grey ramp for summary levels: originals bright, deep summaries dim. */
+const RAMP = ["#e6e6e6", "#c9c9c9", "#a9a9a9", "#8b8b8b", "#6f6f6f", "#565656"];
+const rampColor = (level: number) => RAMP[Math.min(level, RAMP.length - 1)]!;
+
+const kindInk = (theme: AnyRec | undefined, kind: string): any => {
+  switch (kind) {
+    case "user":
+      return ink(theme, "info");
+    case "talk":
+      return ink(theme, "ok");
+    case "tool":
+      return ink(theme, "warn");
+    case "echo":
+      return ink(theme, "muted");
+    default:
+      return ink(theme, "text");
+  }
+};
+
 interface Entry {
   at: number;
   snapshot: St.ChatSnapshot;
   gains: St.Gains;
   usage?: St.RealUsage;
+  prices: St.Prices;
+  paidUsd?: number;
+  windowTokens?: number;
 }
+
+const HEAD_LABELS =
+  /^\s+(session|messages|transcript|context sent|budget used|compression|requests|tokens|paid|prices|model|method|last request)\b/;
 
 export default Plugin.define({
   id: "optchat.cli",
 
   setup(ctx: AnyRec) {
     const cache = new Map<string, Entry>();
-    const log = (line: string) => {
+    const log = (text: string) => {
       void import("node:fs/promises")
-        .then(({ appendFile }) => appendFile(join(S.dataDir(), "tui.log"), `${new Date().toISOString()} ${line}\n`, "utf8"))
+        .then(({ appendFile }) => appendFile(join(S.dataDir(), "tui.log"), `${new Date().toISOString()} ${text}\n`, "utf8"))
         .catch(() => {});
     };
 
@@ -89,56 +114,74 @@ export default Plugin.define({
       const recent = await St.recentChats(12);
       if (!recent.length) {
         await ctx.ui.dialog.alert({
-          title: "optchat — aucune session",
-          message: "optchat mesure la session courante et il n'y a encore aucun chat enregistré.\n\nOuvre une session et laisse passer un tour de conversation, puis relance /optchat.",
+          title: "optchat — no session",
+          message:
+            "optchat measures the session you are in, and no chat has been recorded yet.\n\nOpen a session, send one message, then run /optchat again.",
         });
         return undefined;
       }
-      const picked = await ctx.ui.dialog.select<string>({
-        title: `optchat — quelle session ? (${why})`,
-        placeholder: "taper pour filtrer",
+      return await ctx.ui.dialog.select<string>({
+        title: `optchat — which session? (${why})`,
+        placeholder: "type to filter",
         options: recent.map((c) => ({
           title: c.sessionID,
           value: c.sessionID,
-          description: `${c.messages} lignes · ${St.fmtBytes(c.bytes)} · ${c.when}`,
+          description: `${c.messages} lines · ${St.fmtBytes(c.bytes)} · ${c.when}`,
         })),
       });
-      return picked;
     }
 
-    async function models() {
+    /** Model catalogue entries, raw records included so prices can be read. */
+    async function catalogue(): Promise<AnyRec[]> {
       try {
         const collection = ctx.data?.location?.model;
         await collection?.sync?.();
-        const list: AnyRec[] = collection?.list?.() ?? [];
-        return list
-          .map((m) => ({
-            ref: `${m.providerID ?? m.provider?.id}/${m.id ?? m.modelID}`,
-            name: m.name ?? m.id ?? m.modelID,
-            provider: m.providerID ?? m.provider?.id ?? "?",
-          }))
-          .filter((m) => m.ref.includes("/") && !m.ref.includes("undefined"));
+        return (collection?.list?.() ?? []) as AnyRec[];
       } catch {
         return [];
       }
     }
 
+    /** Prices of the model a session runs on, from the catalogue when possible. */
+    async function pricesFor(sessionID: string, settings: S.Settings): Promise<{ prices: St.Prices; windowTokens?: number }> {
+      // cacheRead defaults to the settings ratio × input price when the catalogue is silent
+      const fallback: St.Prices = { ...St.DEFAULT_PRICES, cacheRead: settings.cacheRatio * St.DEFAULT_PRICES.input };
+      try {
+        const info = ctx.data?.session?.get?.(sessionID) as AnyRec | undefined;
+        const ref = info?.model as AnyRec | undefined;
+        const list = await catalogue();
+        const match = ref
+          ? list.find((m) => (m.modelID ?? m.id) === ref.id && m.providerID === ref.providerID) ??
+            list.find((m) => (m.modelID ?? m.id) === ref.id)
+          : undefined;
+        if (!match) return { prices: fallback };
+        const prices = St.pricesFromModel(match, fallback);
+        const windowTokens = typeof match.limit?.context === "number" ? match.limit.context : undefined;
+        return { prices, windowTokens };
+      } catch {
+        return { prices: fallback };
+      }
+    }
+
     async function compute(sessionID: string, budget: number): Promise<Entry> {
       const started = Date.now();
-      const loaded = await St.loadChat(sessionID, budget);
-      const rows = loaded.rows;
       const settings = await S.readSettings();
-      const g = St.gains(sessionID, loaded, rows, settings.ratio);
+      const loaded = await St.loadChat(sessionID, budget);
+      const g = St.gains(sessionID, loaded, loaded.rows, settings.ratio);
       let usage: St.RealUsage | undefined;
+      let paidUsd: number | undefined;
       try {
+        const info = ctx.data?.session?.get?.(sessionID) as AnyRec | undefined;
+        if (typeof info?.cost === "number") paidUsd = info.cost;
         const messages: AnyRec[] = ctx.data?.session?.message?.list?.(sessionID) ?? [];
         if (messages.length) usage = St.realUsage(messages);
       } catch {
         usage = undefined;
       }
-      const entry: Entry = { at: Date.now(), snapshot: loaded.snapshot, gains: g, usage };
+      const { prices, windowTokens } = await pricesFor(sessionID, settings);
+      const entry: Entry = { at: Date.now(), snapshot: loaded.snapshot, gains: g, usage, prices, paidUsd, windowTokens };
       cache.set(sessionID, entry);
-      log(`stats ${sessionID}: ${loaded.snapshot.messages} msgs, vue ${loaded.snapshot.sentBytes} o, ${Date.now() - started}ms`);
+      log(`stats ${sessionID}: ${loaded.snapshot.messages} msgs, view ${loaded.snapshot.sentBytes} B, ${Date.now() - started}ms`);
       return entry;
     }
 
@@ -149,39 +192,78 @@ export default Plugin.define({
       return compute(sessionID, settings.view);
     }
 
-    // ---------------------------------------------------------------- popup
+    // ---------------------------------------------------------------- screens
 
     function Dialog(props: { title: string; children: any; footer?: string }) {
       let off: (() => void) | undefined;
       onMount(() => {
-        ctx.ui.dialog.set({ size: "large" });
+        ctx.ui.dialog.set({ size: "xlarge" });
         off = ctx.keymap.layer(() => ({
           mode: "modal",
           commands: [
-            { id: "optchat.popup.close", title: "Fermer", bind: "escape", run: () => ctx.ui.dialog.clear() },
-            { id: "optchat.popup.back", title: "Retour", bind: "backspace", run: () => ctx.ui.dialog.clear() },
+            { id: "optchat.popup.close", title: "Close", bind: "escape", run: () => ctx.ui.dialog.clear() },
+            { id: "optchat.popup.back", title: "Back", bind: "backspace", run: () => ctx.ui.dialog.clear() },
           ],
         }));
       });
       onCleanup(() => off?.());
       return (
         <box paddingLeft={2} paddingRight={2} flexDirection="column" height="100%">
-          <text fg={ratio(ctx.theme, "ok")}>
+          <text fg={ink(ctx.theme, "ok")}>
             <b>{props.title}</b>
           </text>
           <scrollbox scrollY flexGrow={1} gap={0}>
             {props.children}
           </scrollbox>
-          <text fg={ratio(ctx.theme, "muted")}>{props.footer ?? "esc fermer"}</text>
+          <text fg={ink(ctx.theme, "muted")}>{props.footer ?? "esc close"}</text>
         </box>
       );
     }
 
-    function showLines(title: string, lines: string[], footer?: string) {
+    /** One report line, styled by role: headers, warnings, the saving line. */
+    function reportLine(line: string, i: number) {
+      if (line.startsWith("## "))
+        return (
+          <text fg={ink(ctx.theme, "info")} key={i}>
+            <b>{line.slice(3)}</b>
+          </text>
+        );
+      if (line.startsWith("⚠"))
+        return (
+          <text fg={ink(ctx.theme, "warn")} key={i}>
+            {line}
+          </text>
+        );
+      if (/^\s+saved\b/.test(line))
+        return (
+          <text fg={ink(ctx.theme, "ok")} key={i}>
+            {line}
+          </text>
+        );
+      if (line.includes("█"))
+        return (
+          <text fg={ink(ctx.theme, "text")} key={i}>
+            {line}
+          </text>
+        );
+      if (HEAD_LABELS.test(line))
+        return (
+          <text fg={ink(ctx.theme, "text")} key={i}>
+            {line}
+          </text>
+        );
+      return (
+        <text fg={ink(ctx.theme, "muted")} key={i}>
+          {line || " "}
+        </text>
+      );
+    }
+
+    function showReport(title: string, lines: string[], footer?: string) {
       ctx.ui.dialog.show(() => (
         <Dialog title={title} footer={footer}>
           <box flexDirection="column">
-            <For each={lines}>{(line) => <text fg={ratio(ctx.theme, line.includes("→") || line.includes("×") ? "ok" : "text")}>{line || " "}</text>}</For>
+            <For each={lines}>{(line, i) => reportLine(line, i())}</For>
           </box>
         </Dialog>
       ));
@@ -190,123 +272,180 @@ export default Plugin.define({
     async function showStats(sessionID: string) {
       const settings = await S.readSettings();
       const entry = await entryFor(sessionID, true);
-      const lines = St.reportLines(entry.snapshot, entry.gains, {
+      const lines = St.statsLines(entry.snapshot, entry.gains, {
         ratio: settings.ratio,
-        cacheRatio: settings.cacheRatio,
         budget: settings.view,
+        prices: entry.prices,
         usage: entry.usage,
+        paidUsd: entry.paidUsd,
+        windowTokens: entry.windowTokens,
       });
-      showLines(`optchat — stats de ${sessionID}`, lines, "esc fermer  ·  r rafraîchir");
-    }
-
-    async function showView(sessionID: string, mode: "line" | "placeholder", title: string) {
-      const loaded = await St.loadChat(sessionID);
-      const text = C.renderView(loaded.state, mode);
-      const lines = text.split("\n");
-      showLines(`${title} — ${lines.length - 2} lignes`, lines, "esc fermer  ·  ↑/↓ défiler");
+      const compression = entry.snapshot.transcriptBytes / Math.max(1, entry.snapshot.sentBytes);
+      showReport(
+        `optchat — stats · ${entry.snapshot.messages} messages · ×${compression.toFixed(1)} compression`,
+        lines,
+        "esc close",
+      );
     }
 
     async function showTree(sessionID: string) {
       const loaded = await St.loadChat(sessionID);
-      const keys = [...loaded.state.nodes.keys()].sort((a, b) => {
-        const [la, ia] = a.split(":").map(Number);
-        const [lb, ib] = b.split(":").map(Number);
-        return la! - lb! || ia! - ib!;
-      });
-      if (keys.length === 0) return showLines("optchat — arbre", ["Aucun résumé construit pour l'instant (les messages courts sont leur propre ligne)."]);
-      const lines = keys.map((key) => {
-        const [l, i] = key.split(":").map(Number);
-        const [start, stop] = C.covers(l!, i!);
-        const text = loaded.state.nodes.get(key)!;
-        return `L${l} ${key}  msgs ${start}-${stop - 1}  ${C.byteLen(text)} o  ${C.oneLine(text).slice(0, 72)}`;
-      });
-      showLines(`optchat — arbre de ${sessionID}`, lines, "esc fermer  ·  ↑/↓ défiler");
+      showReport(`optchat — summaries · ${loaded.state.nodes.size} nodes`, St.treeLines(loaded), "esc close · ↑/↓ scroll");
     }
 
-    async function settingsMenu(): Promise<void> {
+    /** The view, one line per part: originals bright, summaries on a grey ramp. */
+    async function showView(sessionID: string) {
+      const settings = await S.readSettings();
+      const loaded = await St.loadChat(sessionID, settings.view);
+      const parts = St.viewParts(loaded);
+      const snap = loaded.snapshot;
+      const compression = snap.transcriptBytes / Math.max(1, snap.sentBytes);
+      const maxLevel = parts.reduce((a, p) => Math.max(a, p.level), 0);
+      ctx.ui.dialog.show(() => (
+        <Dialog
+          title={`optchat — view sent to the model · ${parts.length} parts · ${St.fmtBytes(snap.sentBytes)} of the ${St.fmtBytes(snap.budget)} budget`}
+          footer="esc close · ↑/↓ scroll"
+        >
+          <box flexDirection="column">
+            <text fg={ink(ctx.theme, "muted")}>{`originals bright · summaries on a grey ramp (L1 light → L${maxLevel} dark)`}</text>
+            <text fg={ink(ctx.theme, "muted")}>{`${St.fmtBytes(snap.transcriptBytes)} of log → ${St.fmtBytes(snap.sentBytes)} sent (×${compression.toFixed(1)}) · zoom(start, count) recovers an original`}</text>
+            <text> </text>
+            <For each={parts}>
+              {(p) => (
+                <text>
+                  <span fg={rampColor(p.level)}>{`L${p.level}·${String(p.index).padStart(4)} `}</span>
+                  <span fg={p.kind === "summary" ? rampColor(p.level) : kindInk(ctx.theme, p.kind)}>{p.kind.padEnd(7)}</span>
+                  <span fg={ink(ctx.theme, "muted")}>{St.fmtBytes(p.bytes).padStart(7)} </span>
+                  <span fg={p.whole ? ink(ctx.theme, "muted") : ink(ctx.theme, "warn")}>
+                    {(p.kind === "summary" ? `${p.covers[1] - p.covers[0]} msg` : p.whole ? "whole" : "cut").padEnd(6)}
+                  </span>
+                  <span fg={p.kind === "summary" ? rampColor(p.level) : ink(ctx.theme, "text")}>{p.preview.slice(0, 48).padEnd(48)}</span>
+                  {p.whole ? null : <span fg={ink(ctx.theme, "warn")}>{` [z(${p.covers[0]},${p.covers[1] - p.covers[0]})]`}</span>}
+                </text>
+              )}
+            </For>
+          </box>
+        </Dialog>
+      ));
+    }
+
+    /** The exact string the model receives, for whoever wants the raw text. */
+    async function showRaw(sessionID: string) {
+      const loaded = await St.loadChat(sessionID);
+      const lines = C.renderView(loaded.state, "line").split("\n");
+      showReport(`optchat — raw context string · ${Math.max(0, lines.length - 2)} parts`, lines, "esc close · ↑/↓ scroll");
+    }
+
+    async function showSettings(): Promise<void> {
       const settings = await S.readSettings();
       const path = S.settingsPath();
       const choice = await ctx.ui.dialog.select<string>({
-        title: "optchat — réglages",
-        placeholder: "taper pour filtrer",
-        current: "enabled",
+        title: "optchat — settings",
+        placeholder: "type to filter",
         options: [
           {
-            title: settings.enabled ? "Désactiver la mémoire" : "Activer la mémoire",
+            title: settings.enabled ? "Memory: on — turn it off" : "Memory: off — turn it on",
             value: "toggle",
-            description: settings.enabled ? "le prochain tour repartira du transcript complet" : "la vue redevient le contexte de chaque tour",
+            description: settings.enabled
+              ? "the next turn would carry the whole transcript again"
+              : "the view becomes the context of every turn again",
           },
-          { title: `Modèle de compaction : ${S.formatModel(settings.compactor)}`, value: "compactor", description: "modèle qui écrit les résumés — prend effet au tour suivant" },
-          { title: `Budget de la vue : ${St.fmtBytes(settings.view)}`, value: "view", description: `plafond du contexte envoyé (~${St.fmtTokens(settings.view / settings.ratio)} tokens)` },
-          { title: `Ratio d'estimation : ${settings.ratio} octets/token`, value: "ratio", description: "sert aux calculs de gain affichés" },
-          { title: `Prix du cache : ${Math.round(settings.cacheRatio * 100)}%`, value: "cache", description: "part du prix d'entrée payée pour un token relu du cache" },
-          { title: `Cap par résultat d'outil : ${St.fmtBytes(settings.cap)}`, value: "cap" },
-          { title: "Où sont ces réglages ?", value: "path", description: path },
+          {
+            title: `Compactor model — ${S.formatModel(settings.compactor)}`,
+            value: "compactor",
+            description: "the model that writes summaries; applies from the next turn",
+          },
+          {
+            title: `Context budget — ${St.fmtBytes(settings.view)}`,
+            value: "view",
+            description: `cap on the context sent per turn (≈ ${St.fmtTokens(settings.view / settings.ratio)} tokens)`,
+          },
+          {
+            title: `Tool result cap — ${St.fmtBytes(settings.cap)}`,
+            value: "cap",
+            description: "how much of a tool result is written to the log",
+          },
+          {
+            title: `Bytes per token — ${settings.ratio}`,
+            value: "ratio",
+            description: "used for every size and token estimate shown here",
+          },
+          { title: "Where do these live?", value: "path", description: path },
         ],
       });
       if (choice === undefined) return;
 
       if (choice === "path") {
-        await ctx.ui.dialog.alert({ title: "optchat — settings.json", message: `${path}\n\nLe serveur relit ce fichier à chaque tour : aucune redémarrage nécessaire.` });
-        return settingsMenu();
+        await ctx.ui.dialog.alert({
+          title: "optchat — settings.json",
+          message: `${path}\n\nThe server re-reads this file on every turn: no restart needed.\nPrices come from the model catalogue (USD per million tokens), not from here.`,
+        });
+        return showSettings();
       }
       if (choice === "toggle") {
         const next = await S.writeSettings({ enabled: !settings.enabled });
-        ctx.ui.toast.show({ title: "optchat", message: next.enabled ? "mémoire activée" : "mémoire désactivée", variant: next.enabled ? "success" : "warning" });
-        return settingsMenu();
+        ctx.ui.toast.show({
+          title: "optchat",
+          message: next.enabled ? "memory on" : "memory off",
+          variant: next.enabled ? "success" : "warning",
+        });
+        return showSettings();
       }
       if (choice === "compactor") {
-        const list = await models();
+        const list = await catalogue();
         const picked = await ctx.ui.dialog.select<string>({
-          title: "optchat — modèle de compaction",
-          placeholder: "taper pour filtrer",
+          title: "optchat — compactor model",
+          placeholder: "type to filter",
           current: settings.compactor,
           options: [
-            { title: "(modèle de la session)", value: "", description: "par défaut : le modèle utilisé dans la conversation" },
-            ...list.map((m) => ({ title: m.name, value: m.ref, description: m.provider, category: m.provider })),
+            { title: "(the session's model)", value: "", description: "default: whatever the conversation runs on" },
+            ...list.map((m) => ({
+              title: String(m.name ?? m.modelID ?? m.id),
+              value: `${m.providerID}/${m.modelID ?? m.id}`,
+              description: String(m.providerID ?? ""),
+              category: String(m.providerID ?? ""),
+            })),
           ],
         });
         if (picked !== undefined) {
           await S.writeSettings({ compactor: picked });
-          ctx.ui.toast.show({ title: "optchat", message: `compacteur : ${S.formatModel(picked)}`, variant: "success" });
+          ctx.ui.toast.show({ title: "optchat", message: `compactor: ${S.formatModel(picked)}`, variant: "success" });
         }
-        return settingsMenu();
+        return showSettings();
       }
       if (choice === "view") {
         const picked = await ctx.ui.dialog.select<number>({
-          title: "optchat — budget de la vue",
+          title: "optchat — context budget",
           current: settings.view,
           options: S.VIEW_CHOICES.map((v) => ({
             title: St.fmtBytes(v),
             value: v,
-            description: `≈ ${St.fmtTokens(v / settings.ratio)} tokens de contexte porté à chaque tour`,
+            description: `≈ ${St.fmtTokens(v / settings.ratio)} tokens carried on every turn`,
           })),
         });
         if (picked !== undefined) {
           await S.writeSettings({ view: picked });
-          ctx.ui.toast.show({ title: "optchat", message: `budget de vue : ${St.fmtBytes(picked)}`, variant: "success" });
+          ctx.ui.toast.show({ title: "optchat", message: `context budget: ${St.fmtBytes(picked)}`, variant: "success" });
         }
-        return settingsMenu();
+        return showSettings();
       }
       if (choice === "cap") {
         const picked = await ctx.ui.dialog.select<number>({
-          title: "optchat — cap par résultat d'outil",
+          title: "optchat — tool result cap",
           current: settings.cap,
           options: [10_000, 20_000, 30_000, 50_000, 80_000].map((v) => ({ title: St.fmtBytes(v), value: v })),
         });
         if (picked !== undefined) await S.writeSettings({ cap: picked });
-        return settingsMenu();
+        return showSettings();
       }
-      if (choice === "ratio" || choice === "cache") {
-        const values = choice === "ratio" ? S.RATIO_CHOICES : [0, 0.1, 0.2, 0.3, 0.5];
-        const currentValue = choice === "ratio" ? settings.ratio : settings.cacheRatio;
+      if (choice === "ratio") {
         const picked = await ctx.ui.dialog.select<number>({
-          title: choice === "ratio" ? "optchat — ratio octets/token" : "optchat — prix du cache",
-          current: currentValue,
-          options: values.map((v) => ({ title: choice === "ratio" ? `${v} octets/token` : `${Math.round(v * 100)}%`, value: v })),
+          title: "optchat — bytes per token",
+          current: settings.ratio,
+          options: S.RATIO_CHOICES.map((v) => ({ title: `${v} bytes/token`, value: v })),
         });
-        if (picked !== undefined) await S.writeSettings(choice === "ratio" ? { ratio: picked } : { cacheRatio: picked });
-        return settingsMenu();
+        if (picked !== undefined) await S.writeSettings({ ratio: picked });
+        return showSettings();
       }
     }
 
@@ -314,31 +453,47 @@ export default Plugin.define({
       const entry = await entryFor(sessionID, true);
       const snap = entry.snapshot;
       const settings = await S.readSettings();
-      log(`popup ${sessionID}: ${snap.messages} msgs, vue ${snap.sentBytes} o, ${snap.viewLines} lignes, ${entry.gains.requests} requêtes`);
+      const compression = snap.transcriptBytes / Math.max(1, snap.sentBytes);
+      log(`popup ${sessionID}: ${snap.messages} msgs, view ${snap.sentBytes} B, ${snap.viewLines} parts, ${entry.gains.requests} requests`);
+
       const choice = await ctx.ui.dialog.select<string>({
-        title: `optchat — ${snap.messages} messages · vue ${St.fmtBytes(snap.sentBytes)} · ×${(snap.transcriptBytes / Math.max(1, snap.sentBytes)).toFixed(1)}`,
-        placeholder: "taper pour filtrer",
+        title: `optchat — ${snap.messages} messages · view ${St.fmtBytes(snap.sentBytes)} · ×${compression.toFixed(1)} compression`,
+        placeholder: "type to filter",
         options: [
           {
-            title: "Stats de la session",
+            title: "Stats",
             value: "stats",
             description: entry.gains.requests
-              ? `gain vs transcript complet, cache, tokens (${St.fmtTokens(entry.gains.last.ours)} tok/tour)`
-              : "gain vs transcript complet, cache, tokens",
+              ? `context per turn and cost with/without optchat (${St.fmtTokens(entry.gains.last.ours)} tok/turn now)`
+              : "context per turn and cost with/without optchat",
           },
-          { title: "Vue — ce que le modèle voit", value: "view", description: `${snap.viewLines} lignes, ${St.fmtBytes(snap.sentBytes)}, ${Math.round((snap.viewBytes / settings.view) * 100)}% du budget` },
-          { title: "Arbre des résumés", value: "tree", description: `${snap.nodes} nœuds — ${snap.settled ? "à jour" : `${snap.unsettled} lignes en attente`}` },
-          { title: `Réglages${settings.enabled ? "" : "  (mémoire désactivée)"}`, value: "settings", description: `compacteur ${S.formatModel(settings.compactor)} · vue ${St.fmtBytes(settings.view)}` },
-          { title: "Fermer", value: "close" },
+          {
+            title: "View",
+            value: "view",
+            description: `${snap.viewLines} parts, ${St.fmtBytes(snap.sentBytes)} — one readable line per part`,
+          },
+          {
+            title: "Summaries",
+            value: "tree",
+            description: `${snap.nodes} nodes — ${snap.settled ? "up to date" : `${snap.unsettled} lines waiting for the compactor`}`,
+          },
+          {
+            title: `Settings${settings.enabled ? "" : "  (memory off)"}`,
+            value: "settings",
+            description: `compactor ${S.formatModel(settings.compactor)} · budget ${St.fmtBytes(settings.view)}`,
+          },
+          { title: "Raw context string", value: "raw", description: "the exact text sent, as the model sees it" },
+          { title: "Close", value: "close" },
         ],
       });
       if (choice === "stats") return showStats(sessionID);
-      if (choice === "view") return showView(sessionID, "line", `optchat — vue envoyée`);
+      if (choice === "view") return showView(sessionID);
       if (choice === "tree") return showTree(sessionID);
-      if (choice === "settings") return settingsMenu();
+      if (choice === "settings") return showSettings();
+      if (choice === "raw") return showRaw(sessionID);
     }
 
-    // ------------------------------------------------------------- commands
+    // -------------------------------------------------------------- commands
 
     const guard = async (what: (sessionID: string) => Promise<void>, why: string) => {
       try {
@@ -359,7 +514,7 @@ export default Plugin.define({
       const next = await S.writeSettings({ enabled: on });
       ctx.ui.toast.show({
         title: "optchat",
-        message: next.enabled ? "mémoire activée" : "mémoire désactivée",
+        message: next.enabled ? "memory on" : "memory off",
         variant: next.enabled ? "success" : "warning",
       });
     };
@@ -369,7 +524,7 @@ export default Plugin.define({
       commands: [
         {
           id: "optchat.menu",
-          title: "optchat : mémoire, stats, réglages",
+          title: "optchat: memory, stats, settings",
           group: "optchat",
           palette: true,
           suggested: true,
@@ -379,16 +534,17 @@ export default Plugin.define({
             return void guard((id) => menu(id), "menu");
           },
         },
-        { id: "optchat.stats", title: "optchat : stats de la session", group: "optchat", slash: { name: "optchat_stats" }, run: () => void guard((id) => showStats(id), "stats") },
-        { id: "optchat.view", title: "optchat : vue envoyée au modèle", group: "optchat", slash: { name: "optchat_view" }, run: () => void guard((id) => showView(id, "line", "optchat — vue envoyée"), "vue") },
-        { id: "optchat.tree", title: "optchat : arbre des résumés", group: "optchat", slash: { name: "optchat_tree" }, run: () => void guard((id) => showTree(id), "arbre") },
-        { id: "optchat.settings", title: "optchat : réglages", group: "optchat", slash: { name: "optchat_settings" }, run: () => void settingsMenu().catch((err) => log(`error settings: ${String(err)}`)) },
-        { id: "optchat.on", title: "optchat : activer la mémoire", group: "optchat", slash: { name: "optchat_on" }, run: () => void toggle(true) },
-        { id: "optchat.off", title: "optchat : désactiver la mémoire", group: "optchat", slash: { name: "optchat_off" }, run: () => void toggle(false) },
+        { id: "optchat.stats", title: "optchat: session stats", group: "optchat", slash: { name: "optchat_stats" }, run: () => void guard((id) => showStats(id), "stats") },
+        { id: "optchat.view", title: "optchat: view sent to the model", group: "optchat", slash: { name: "optchat_view" }, run: () => void guard((id) => showView(id), "view") },
+        { id: "optchat.tree", title: "optchat: summary tree", group: "optchat", slash: { name: "optchat_tree" }, run: () => void guard((id) => showTree(id), "tree") },
+        { id: "optchat.raw", title: "optchat: raw context string", group: "optchat", slash: { name: "optchat_raw" }, run: () => void guard((id) => showRaw(id), "raw") },
+        { id: "optchat.settings", title: "optchat: settings", group: "optchat", slash: { name: "optchat_settings" }, run: () => void showSettings().catch((err) => log(`error settings: ${String(err)}`)) },
+        { id: "optchat.on", title: "optchat: turn memory on", group: "optchat", slash: { name: "optchat_on" }, run: () => void toggle(true) },
+        { id: "optchat.off", title: "optchat: turn memory off", group: "optchat", slash: { name: "optchat_off" }, run: () => void toggle(false) },
       ],
     }));
 
-    // --------------------------------------------------------------- widget
+    // ---------------------------------------------------------------- widget
 
     function Widget(props: { sessionID: string }) {
       const [line, setLine] = createSignal<string | undefined>();
@@ -398,21 +554,21 @@ export default Plugin.define({
         try {
           const settings = await S.readSettings();
           if (!settings.enabled) {
-            setLine("optchat · désactivé");
+            setLine("optchat · off");
             setTone("muted");
             return;
           }
           const entry = await entryFor(props.sessionID);
           const snap = entry.snapshot;
           if (snap.messages === 0) {
-            setLine("optchat · pas de mémoire");
+            setLine("optchat · no memory yet");
             setTone("muted");
             return;
           }
-          const ratioGain = snap.transcriptBytes / Math.max(1, snap.sentBytes);
+          const compression = snap.transcriptBytes / Math.max(1, snap.sentBytes);
           setLine(
-            `optchat · ${snap.messages} msg · vue ${St.fmtBytes(snap.sentBytes)} · ×${ratioGain.toFixed(1)}` +
-              (snap.settled ? "" : ` · ${snap.unsettled} en attente`),
+            `optchat · ${snap.messages} msgs · view ${St.fmtBytes(snap.sentBytes)} · ×${compression.toFixed(1)}` +
+              (snap.settled ? "" : ` · ${snap.unsettled} waiting`),
           );
           setTone(snap.settled ? "ok" : "warn");
         } catch {
@@ -435,7 +591,7 @@ export default Plugin.define({
 
       return (
         <box flexDirection="row" gap={1}>
-          <text fg={ratio(ctx.theme, tone())}>{line() ?? "optchat · …"}</text>
+          <text fg={ink(ctx.theme, tone())}>{line() ?? "optchat · …"}</text>
         </box>
       );
     }
@@ -446,7 +602,7 @@ export default Plugin.define({
       log(`sidebar slot refused: ${String(err)}`);
     }
 
-    log(`loaded (plugin path ${S.settingsPath()}, home ${homedir()})`);
+    log(`loaded (settings ${S.settingsPath()}, home ${homedir()})`);
     return () => off?.();
   },
 });

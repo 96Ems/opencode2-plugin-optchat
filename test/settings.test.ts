@@ -87,9 +87,9 @@ describe("settings", () => {
 
 describe("stats formatting", () => {
   test("bytes and tokens", () => {
-    expect(St.fmtBytes(512)).toBe("512 o");
-    expect(St.fmtBytes(2048)).toBe("2.0 Ko");
-    expect(St.fmtBytes(1536 * 1024)).toBe("1.50 Mo");
+    expect(St.fmtBytes(512)).toBe("512 B");
+    expect(St.fmtBytes(2048)).toBe("2.0 KB");
+    expect(St.fmtBytes(1536 * 1024)).toBe("1.50 MB");
     expect(St.fmtTokens(950)).toBe("950");
     expect(St.fmtTokens(41_400)).toBe("41.4k");
     expect(St.fmtTokens(1_028_000)).toBe("1.03M");
@@ -150,9 +150,9 @@ describe("stats over a real chat directory", () => {
     await writeChat(30, 2000);
     const loaded = await St.loadChat(session, 64_000);
     const gains = St.gains(session, loaded, loaded.rows, 1.3);
-    const lines = St.reportLines(loaded.snapshot, gains, { ratio: 1.3, cacheRatio: 0.1, budget: 64_000 }).join("\n");
+    const lines = St.reportLines(loaded.snapshot, gains, { ratio: 1.3, budget: 64_000 }).join("\n");
     expect(lines).toContain("compression");
-    expect(lines).toContain("historique porté à chaque tour");
+    expect(lines).toContain("Context carried per turn");
     expect(lines).toContain("×");
   });
 
@@ -160,8 +160,8 @@ describe("stats over a real chat directory", () => {
     const loaded = await St.loadChat("ses_inconnue", 128_000);
     expect(loaded.snapshot.messages).toBe(0);
     expect(loaded.snapshot.exists).toBe(false);
-    const lines = St.reportLines(loaded.snapshot, St.gains("x", loaded, [], 1.3), { ratio: 1.3, cacheRatio: 0.1, budget: 128_000 }).join("\n");
-    expect(lines).toContain("aucune mémoire");
+    const lines = St.reportLines(loaded.snapshot, St.gains("x", loaded, [], 1.3), { ratio: 1.3, budget: 128_000 }).join("\n");
+    expect(lines).toContain("no memory for this session yet");
   });
 });
 
@@ -204,5 +204,160 @@ describe("recentChats", () => {
     const list = await St.recentChats(1);
     expect(list.length).toBe(1);
     expect(list[0]!.sessionID).toBe("ses_b");
+  });
+});
+
+describe("money", () => {
+  const prices: St.Prices = { input: 1, output: 10, cacheRead: 0.1, cacheWrite: 1, model: "p/m", source: "catalogue" };
+
+  test("prices come from a catalogue record, with a fallback", () => {
+    const model = { providerID: "acme", modelID: "fast", cost: [{ input: 0.5, output: 2, cache: { read: 0.05, write: 0.6 } }] };
+    const p = St.pricesFromModel(model);
+    expect(p.input).toBe(0.5);
+    expect(p.cacheRead).toBe(0.05);
+    expect(p.model).toBe("acme/fast");
+    expect(p.source).toBe("catalogue");
+    // a model without cost data falls back instead of lying
+    expect(St.pricesFromModel({ providerID: "x", modelID: "y" }).source).toBe("default");
+  });
+
+  test("the first request pays everything fresh, the next ones only the tail", () => {
+    const series = [
+      { full: 1_000_000, ours: 100_000 },
+      { full: 2_000_000, ours: 100_000 },
+    ];
+    const c = St.costs(series, { prices });
+    expect(c.without.fresh).toBe(2_000_000);
+    expect(c.without.cached).toBe(1_000_000);
+    expect(c.without.usd).toBeCloseTo(2 * 1 + 1 * 0.1, 6);
+    expect(c.with.usd).toBeCloseTo(0.1 * 1 + 0.1 * 0.1, 6);
+    expect(c.measuredWith).toBe(false);
+    expect(c.savedUsd).toBeGreaterThan(0);
+    expect(c.perTurn.withoutUsd).toBeCloseTo(1 * 1 + 1 * 0.1, 6);
+  });
+
+  test("the provider's own token counts win when the session carries them", () => {
+    const usage: St.RealUsage = {
+      requests: 1,
+      last: { input: 5, cache: 100, output: 7 },
+      totals: { input: 5, cache: 100, output: 7 },
+      series: [{ input: 5, cache: 100, output: 7 }],
+    };
+    const c = St.costs([{ full: 900_000, ours: 900_000 }], { prices, usage, paidUsd: 0.001 });
+    expect(c.measuredWith).toBe(true);
+    expect(c.with.usd).toBeCloseTo((5 / 1e6) * 1 + (100 / 1e6) * 0.1 + (7 / 1e6) * 10, 9);
+    expect(c.savedUsd).toBeCloseTo(c.without.usd - 0.001, 9);
+  });
+
+  test("counts the requests that would not have fitted the window", () => {
+    const c = St.costs([{ full: 300_000, ours: 1_000 }, { full: 400_000, ours: 1_000 }], { prices, windowTokens: 200_000 });
+    expect(c.overWindow).toBe(2);
+  });
+
+  test("realUsage keeps a per-request series", () => {
+    const u = St.realUsage([
+      { tokens: { input: 10, output: 2, cache: { read: 100 } } },
+      { tokens: { input: 20, output: 4, cache: { read: 200 } } },
+    ]);
+    expect(u.requests).toBe(2);
+    expect(u.series.length).toBe(2);
+    expect(u.totals.cache).toBe(300);
+    expect(u.last.input).toBe(20);
+  });
+
+  test("formatUsd keeps small numbers readable", () => {
+    expect(St.formatUsd(0)).toBe("$0");
+    expect(St.formatUsd(0.0042)).toBe("$0.0042");
+    expect(St.formatUsd(0.42)).toBe("$0.420");
+    expect(St.formatUsd(3.5)).toBe("$3.50");
+  });
+});
+
+describe("bars and parts", () => {
+  test("a bar fills proportionally to its max", () => {
+    expect(St.bar(0, 100, 10)).toBe("░░░░░░░░░░");
+    expect(St.bar(50, 100, 10)).toBe("█████░░░░░");
+    expect(St.bar(100, 100, 10)).toBe("██████████");
+    expect(St.bar(500, 100, 4)).toBe("████");
+    expect(St.bar(5, 0, 4)).toBe("░░░░");
+    expect(St.pct(50, 100)).toBe(" 50%");
+    expect(St.pct(4, 0)).toBe("  0%");
+  });
+
+  test("viewParts marks originals, summaries and cut text", async () => {
+    const dir = join(home, "ses_v");
+    await fs.mkdir(join(dir, "main"), { recursive: true });
+    const rows = [
+      { i: 0, kind: "user", text: "short" },
+      { i: 1, kind: "talk", text: "y".repeat(3000) },
+    ].map((r) => ({ ...r, size: C.byteLen(`${r.kind}: ${r.text}`), date: "2026-10-05" }));
+    await fs.writeFile(join(dir, "main", "2026-10-05.jsonl"), rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+
+    const loaded = await St.loadChatDir(dir, 100_000);
+    const parts = St.viewParts(loaded);
+    expect(parts.length).toBe(2);
+    expect(parts[0]!.kind).toBe("user");
+    expect(parts[0]!.whole).toBe(true);
+    expect(parts[0]!.covers).toEqual([0, 1]);
+    expect(parts[1]!.whole).toBe(false);
+    expect(parts[1]!.bytes).toBeGreaterThan(0);
+
+    loaded.state.nodes.set(C.nodeKey(0, 1), "talk: summarized");
+    const after = St.viewParts(loaded).find((p) => p.index === 1)!;
+    expect(after.kind).toBe("summary");
+    expect(after.whole).toBe(true);
+    expect(after.preview).toContain("summarized");
+  });
+});
+
+describe("report lines", () => {
+  const prices: St.Prices = { input: 1, output: 10, cacheRead: 0.1, cacheWrite: 1, model: "acme/fast", source: "catalogue" };
+
+  async function sampleChat() {
+    const dir = join(home, "ses_r");
+    await fs.mkdir(join(dir, "main"), { recursive: true });
+    const rows = Array.from({ length: 6 }, (_, i) => {
+      const kind = i % 3 === 0 ? "user" : "talk";
+      const text = `${i} ` + "z".repeat(4000);
+      return { i, kind, text, size: C.byteLen(`${kind}: ${text}`), date: "2026-10-05" };
+    });
+    await fs.writeFile(join(dir, "main", "2026-10-05.jsonl"), rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    await fs.mkdir(join(dir, "tree"), { recursive: true });
+    await fs.writeFile(join(dir, "tree", "2026-10-05.jsonl"), JSON.stringify({ l: 1, i: 0, text: "user: 0 summarized" }) + "\n");
+    const loaded = await St.loadChatDir(dir, 5_000);
+    return { loaded, g: St.gains("ses_r", loaded, loaded.rows, 1.3) };
+  }
+
+  test("statsLines has a session, a per-turn and a cost section", async () => {
+    const { loaded, g } = await sampleChat();
+    const lines = St.statsLines(loaded.snapshot, g, { ratio: 1.3, budget: 5_000, prices });
+    const text = lines.join("\n");
+    expect(text).toContain("## Session");
+    expect(text).toContain("## Context carried per turn");
+    expect(text).toContain("## Cost (estimate, USD)");
+    expect(text).toContain("█");
+    expect(text).toContain("saved");
+    expect(text).toContain("acme/fast");
+    expect(text).not.toMatch(/[éèêàçùôîûœ]/); // the whole report is English
+  });
+
+  test("statsLines says so when the session predates the plugin", () => {
+    const empty = {
+      sessionID: "ses_none", dir: "/nope", exists: false, messages: 0, transcriptBytes: 0, nodes: 0,
+      viewLines: 0, viewBytes: 0, sentBytes: 0, unsettled: 0, settled: true, budget: 128_000,
+    };
+    const g = St.gains("ses_none", { snapshot: empty, state: C.newChatState(), rows: [], transcriptAt: [], viewAt: [] }, [], 1.3);
+    const lines = St.statsLines(empty, g, { ratio: 1.3, budget: 128_000, prices });
+    expect(lines.join("\n")).toContain("no memory for this session yet");
+  });
+
+  test("treeLines lists the levels and the nodes", async () => {
+    const { loaded } = await sampleChat();
+    const lines = St.treeLines(loaded);
+    expect(lines.join("\n")).toContain("## Levels");
+    expect(lines.join("\n")).toContain("level 1");
+    expect(lines.join("\n")).toContain("1:0");
+    const empty = St.treeLines({ ...loaded, state: C.newChatState() });
+    expect(empty.join("\n")).toContain("No summaries yet");
   });
 });

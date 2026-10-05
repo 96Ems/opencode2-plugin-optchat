@@ -38,12 +38,16 @@ export interface Gains {
   cumulative: { full: number; ours: number };
   /** samples at 0/25/50/75/100% of the session */
   samples: { at: number; full: number; ours: number }[];
+  /** context tokens carried by every request, in order (without vs with optchat) */
+  series: { full: number; ours: number }[];
 }
 
 export interface RealUsage {
   requests: number;
   last: { input: number; cache: number; output: number };
   totals: { input: number; cache: number; output: number };
+  /** per request, in order — what the provider really billed */
+  series: { input: number; cache: number; output: number }[];
 }
 
 /** OpenCode session messages carry this; we accept anything shaped like it. */
@@ -114,9 +118,9 @@ async function readJsonl(dir: string, sub: string): Promise<string[]> {
 }
 
 export function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} o`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} Ko`;
-  return `${(n / 1024 / 1024).toFixed(2)} Mo`;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
 export function fmtTokens(n: number): string {
@@ -254,7 +258,15 @@ export function gains(sessionID: string, loaded: LoadedChat, rows: Record<string
     return { at: q, full: at.full, ours: at.ours };
   });
 
-  return { requests: perTurn.length, ratio, last, maxFull, cumulative: { full: cumulativeFull, ours: cumulativeOurs }, samples };
+  return {
+    requests: perTurn.length,
+    ratio,
+    last,
+    maxFull,
+    cumulative: { full: cumulativeFull, ours: cumulativeOurs },
+    samples,
+    series: perTurn,
+  };
 }
 
 /** Real usage as OpenCode reports it, summed over the session's assistant messages. */
@@ -262,6 +274,7 @@ export function realUsage(messages: UsageCarrier[]): RealUsage {
   const totals = { input: 0, cache: 0, output: 0 };
   let last = { input: 0, cache: 0, output: 0 };
   let requests = 0;
+  const series: { input: number; cache: number; output: number }[] = [];
   for (const m of messages) {
     const t = m.tokens;
     if (!t || typeof t.input !== "number") continue;
@@ -270,50 +283,351 @@ export function realUsage(messages: UsageCarrier[]): RealUsage {
     totals.input += row.input;
     totals.cache += row.cache;
     totals.output += row.output;
+    series.push(row);
     last = row;
   }
-  return { requests, last, totals };
+  return { requests, last, totals, series };
+}
+
+// ------------------------------------------------------------------- pricing
+
+/** USD per million tokens, as the model catalogue reports them. */
+export interface Prices {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** "provider/model" these prices belong to ("" for the built-in default) */
+  model: string;
+  source: "catalogue" | "default";
+}
+
+/** Used when the model catalogue cannot be read (offline runs, tests). */
+export const DEFAULT_PRICES: Prices = {
+  input: 0.27,
+  output: 1.1,
+  cacheRead: 0.027,
+  cacheWrite: 0.27,
+  model: "",
+  source: "default",
+};
+
+/** Turn a catalogue `ModelInfo` into prices; falls back when cost is missing. */
+export function pricesFromModel(model: any, fallback: Prices = DEFAULT_PRICES): Prices {
+  const cost = Array.isArray(model?.cost) ? model.cost[0] : undefined;
+  if (!cost || typeof cost.input !== "number" || typeof cost.output !== "number") return fallback;
+  return {
+    input: cost.input,
+    output: cost.output,
+    cacheRead: typeof cost.cache?.read === "number" ? cost.cache.read : fallback.cacheRead,
+    cacheWrite: typeof cost.cache?.write === "number" ? cost.cache.write : fallback.cacheWrite,
+    model: `${model?.providerID ?? "?"}/${model?.modelID ?? model?.id ?? "?"}`,
+    source: "catalogue",
+  };
+}
+
+export function formatUsd(n: number): string {
+  if (!Number.isFinite(n)) return "—";
+  if (n === 0) return "$0";
+  if (n < 0.01) return `$${n.toFixed(4)}`;
+  if (n < 1) return `$${n.toFixed(3)}`;
+  return `$${n.toFixed(2)}`;
+}
+
+export interface CostSide {
+  /** tokens billed at the fresh input price */
+  fresh: number;
+  /** tokens served from the provider's cache */
+  cached: number;
+  output: number;
+  usd: number;
+}
+
+export interface CostEstimate {
+  requests: number;
+  without: CostSide;
+  with: CostSide;
+  savedUsd: number;
+  savedPct: number;
+  perTurn: { withoutUsd: number; withUsd: number };
+  /** true when the "with optchat" column uses the provider's own numbers */
+  measuredWith: boolean;
+  prices: Prices;
+  /** requests whose counterfactual context would not fit the model window */
+  overWindow: number;
+}
+
+/**
+ * Estimate what this session cost and what it would have cost carrying the whole
+ * transcript on every request.
+ *
+ * Without optchat, the prompt of a turn is the whole transcript up to that point:
+ * the unchanged prefix comes from the provider's cache (read price) and the new
+ * tail is billed as fresh input. With optchat the provider's own per-request
+ * numbers are used when the session carries them, otherwise the view sizes are
+ * billed the same way. Output tokens are counted identically on both sides, so
+ * the comparison isolates the effect of the context.
+ */
+export function costs(
+  series: { full: number; ours: number }[],
+  opts: { prices: Prices; usage?: RealUsage; paidUsd?: number; windowTokens?: number },
+): CostEstimate {
+  const p = opts.prices;
+  const usd = (fresh: number, cached: number, output: number) =>
+    (fresh / 1e6) * p.input + (cached / 1e6) * p.cacheRead + (output / 1e6) * p.output;
+
+  const usage = opts.usage && opts.usage.series.length === series.length ? opts.usage : undefined;
+  const measured = Boolean(usage);
+
+  const without: CostSide = { fresh: 0, cached: 0, output: 0, usd: 0 };
+  const side: CostSide = { fresh: 0, cached: 0, output: 0, usd: 0 };
+  let overWindow = 0;
+  let lastTurn = { withoutUsd: 0, withUsd: 0 };
+
+  for (let i = 0; i < series.length; i++) {
+    const full = series[i]!.full;
+    const ours = series[i]!.ours;
+    const out = measured ? usage!.series[i]!.output : 0;
+
+    const prevFull = i > 0 ? series[i - 1]!.full : 0;
+    const wFresh = Math.max(0, full - prevFull) + (i === 0 ? 0 : 0);
+    const wCached = Math.min(prevFull, full);
+    without.fresh += wFresh;
+    without.cached += wCached;
+    without.output += out;
+    if (opts.windowTokens && full > opts.windowTokens) overWindow++;
+
+    let cFresh: number;
+    let cCached: number;
+    let cOut: number;
+    if (measured) {
+      const row = usage!.series[i]!;
+      cFresh = row.input;
+      cCached = row.cache;
+      cOut = row.output;
+    } else {
+      const prevOurs = i > 0 ? series[i - 1]!.ours : 0;
+      cFresh = Math.max(0, ours - prevOurs);
+      cCached = Math.min(prevOurs, ours);
+      cOut = out;
+    }
+    side.fresh += cFresh;
+    side.cached += cCached;
+    side.output += cOut;
+    lastTurn = { withoutUsd: usd(wFresh, wCached, out), withUsd: usd(cFresh, cCached, cOut) };
+  }
+
+  without.usd = usd(without.fresh, without.cached, without.output);
+  side.usd = usd(side.fresh, side.cached, side.output);
+  const billedWith = typeof opts.paidUsd === "number" ? opts.paidUsd : side.usd;
+  const savedUsd = without.usd - billedWith;
+
+  return {
+    requests: series.length,
+    without,
+    with: side,
+    savedUsd,
+    savedPct: without.usd > 0 ? Math.max(0, Math.min(100, (savedUsd / without.usd) * 100)) : 0,
+    perTurn: lastTurn,
+    measuredWith: measured,
+    prices: p,
+    overWindow,
+  };
+}
+
+// ---------------------------------------------------------------------- bars
+
+/** `████░░░░░░░░` — a bar scaled to `max`, no label (callers add the percentage). */
+export function bar(value: number, max: number, width = 12): string {
+  const frac = max > 0 ? Math.max(0, Math.min(1, value / max)) : 0;
+  const filled = Math.round(frac * width);
+  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+}
+
+/** ` 42%` — the share of `max` a value takes, right-aligned. */
+export function pct(value: number, max: number): string {
+  return `${String(Math.round(max > 0 ? (value / max) * 100 : 0)).padStart(3)}%`;
+}
+
+// ----------------------------------------------------------------- view parts
+
+export interface ViewPartInfo {
+  key: string;
+  level: number;
+  index: number;
+  /** original kind for level 0, "summary" once the part is compacted */
+  kind: string;
+  bytes: number;
+  preview: string;
+  /** first and last message index this part stands for */
+  covers: [number, number];
+  /** true when the view carries the whole text (short message or summary) */
+  whole: boolean;
+}
+
+/** Everything the popup needs to draw the view, one entry per part. */
+export function viewParts(loaded: LoadedChat): ViewPartInfo[] {
+  const state = loaded.state;
+  return state.view.map((part) => {
+    const key = C.nodeKey(part.l, part.i);
+    const node = C.nodeText(state, part.l, part.i);
+    const exists = node !== undefined;
+    const covers = C.covers(part.l, part.i);
+    const msg = state.messages[part.i];
+    const text = C.oneLine(node ?? C.partText(state, part, "line"));
+    // verbatim original (short message, or a stored copy of it) vs summary
+    const isOriginal = part.l === 0 && (!exists || (msg !== undefined && C.oneLine(C.msgLine(msg)) === text));
+    const kind = isOriginal ? (msg?.kind ?? "?") : "summary";
+    // no node at level 0 = the fail-safe line, cut with a zoom pointer
+    const whole = exists;
+    return {
+      key: `${part.l}:${part.i}`,
+      level: part.l,
+      index: part.i,
+      kind,
+      bytes: C.partBytes(state, part),
+      preview: C.oneLine(text).slice(0, 68),
+      covers,
+      whole,
+    };
+  });
+}
+
+// ------------------------------------------------------------------- reports
+
+export interface StatsOptions {
+  ratio: number;
+  budget: number;
+  prices: Prices;
+  usage?: RealUsage;
+  /** what the provider charged for this session, when OpenCode knows it */
+  paidUsd?: number;
+  /** model context window, to flag a counterfactual that would not have fit */
+  windowTokens?: number;
+}
+
+const pad = (s: string, n: number) => s.padEnd(n);
+
+function line(label: string, value: string, note = ""): string {
+  return `  ${pad(label, 15)}${pad(value, 24)}${note}`.trimEnd();
+}
+
+/** The "Stats" screen: session, context per turn, cost — one string per line. */
+export function statsLines(snapshot: ChatSnapshot, g: Gains, o: StatsOptions): string[] {
+  const out: string[] = [];
+  const compression = snapshot.transcriptBytes / Math.max(1, snapshot.sentBytes);
+
+  out.push("## Session");
+  out.push(line("session", snapshot.sessionID, snapshot.settled ? `${snapshot.nodes} summaries · up to date` : `${snapshot.nodes} summaries · ${snapshot.unsettled} lines waiting`));
+  out.push(line("messages", String(snapshot.messages), `${snapshot.viewLines} parts in the view`));
+  out.push(line("transcript", fmtBytes(snapshot.transcriptBytes), "kept in the log, never rewritten"));
+  out.push(line("context sent", fmtBytes(snapshot.sentBytes), `budget ${fmtBytes(snapshot.budget)}`));
+  out.push(line("budget used", `${bar(snapshot.viewBytes, snapshot.budget)} ${pct(snapshot.viewBytes, snapshot.budget)}`, ""));
+  out.push(line("compression", `×${compression.toFixed(1)}`, `${fmtBytes(snapshot.transcriptBytes)} of log → ${fmtBytes(snapshot.sentBytes)} of context`));
+
+  if (snapshot.messages === 0) {
+    out.push("");
+    out.push("⚠  no memory for this session yet — it started before the plugin was installed");
+    return out;
+  }
+
+  out.push("");
+  out.push("## Context carried per turn");
+  const scale = Math.max(g.maxFull, 1);
+  out.push(`  ${pad("", 10)}${pad("without optchat", 24)}${"with optchat"}`);
+  if (g.requests > 1) {
+    for (const s of g.samples) {
+      const q = `${Math.round(s.at * 100)}%`.padStart(4);
+      const left = `${bar(s.full, scale)} ${pct(s.full, scale)}  ${pad(`${fmtTokens(s.full)} tok`, 10)}`;
+      const right = `${bar(s.ours, scale)} ${pct(s.ours, scale)}  ${fmtTokens(s.ours)} tok`;
+      out.push(`  ${pad(q, 10)}${pad(left, 34)}${right}`);
+    }
+  }
+  const shrink = g.last.full / Math.max(1, g.last.ours);
+  const shrinkAll = g.cumulative.full / Math.max(1, g.cumulative.ours);
+  out.push(`  ${pad("last turn", 14)}${pad(`${fmtTokens(g.last.full)} tok`, 26)}${pad(`${fmtTokens(g.last.ours)} tok`, 12)}×${shrink.toFixed(1)} smaller`);
+  out.push(`  ${pad("whole session", 14)}${pad(`${fmtTokens(g.cumulative.full)} tok`, 26)}${pad(`${fmtTokens(g.cumulative.ours)} tok`, 12)}×${shrinkAll.toFixed(1)} smaller`);
+
+  const c = costs(g.series, { prices: o.prices, usage: o.usage, paidUsd: o.paidUsd, windowTokens: o.windowTokens });
+  out.push("");
+  out.push("## Cost (estimate, USD)");
+  out.push(`  ${pad("", 20)}${pad("without optchat", 20)}with optchat`);
+  out.push(`  ${pad("last turn", 20)}${pad(formatUsd(c.perTurn.withoutUsd), 20)}${formatUsd(c.perTurn.withUsd)}`);
+  out.push(`  ${pad("whole session", 20)}${pad(formatUsd(c.without.usd), 20)}${formatUsd(c.with.usd)}`);
+  out.push(`  ${pad("saved", 20)}${formatUsd(c.savedUsd)}  (${c.savedPct.toFixed(0)}% less)`);
+  out.push(line("prices", `${formatUsd(c.prices.input)}/M in · ${formatUsd(c.prices.cacheRead)}/M cache read · ${formatUsd(c.prices.output)}/M out`, ""));
+  out.push(line("model", c.prices.model || "(unknown)", c.prices.source === "catalogue" ? "from the model catalogue" : "built-in default prices"));
+  out.push(line("method", "unchanged prefix cached", ""));
+  out.push("        every request bills the new tail fresh and serves the prefix from the cache;");
+  out.push("        answers count the same on both sides, so the gap is the size of the context.");
+  if (c.overWindow > 0 && o.windowTokens) {
+    const w = fmtTokens(o.windowTokens);
+    out.push(`⚠  ${c.overWindow} of ${c.requests} requests would not have fit the ${w} token window without optchat`);
+  }
+
+  if (o.usage && o.usage.requests > 0) {
+    const u = o.usage;
+    out.push("");
+    out.push("## Real usage (billed by the provider)");
+    out.push(line("requests", String(u.requests), ""));
+    out.push(line("tokens", `in ${fmtTokens(u.totals.input)} · cache read ${fmtTokens(u.totals.cache)} · out ${fmtTokens(u.totals.output)}`, ""));
+    out.push(line("last request", `in ${fmtTokens(u.last.input)} · cache ${fmtTokens(u.last.cache)} · out ${fmtTokens(u.last.output)}`, ""));
+    if (typeof o.paidUsd === "number") out.push(line("paid", formatUsd(o.paidUsd), "counted by OpenCode for this session"));
+  }
+  return out;
+}
+
+/** The "Tree" screen: the summary levels and every node. */
+export function treeLines(loaded: LoadedChat, maxNodes = 300): string[] {
+  const keys = [...loaded.state.nodes.keys()].sort((a, b) => {
+    const [la, ia] = a.split(":").map(Number);
+    const [lb, ib] = b.split(":").map(Number);
+    return la! - lb! || ia! - ib!;
+  });
+  const out: string[] = [];
+  if (keys.length === 0) {
+    out.push("No summaries yet — short messages are their own line.");
+    out.push("A summary appears once a message needs more than one line.");
+    return out;
+  }
+  const byLevel = new Map<number, number>();
+  for (const k of keys) {
+    const l = Number(k.split(":")[0]);
+    byLevel.set(l, (byLevel.get(l) ?? 0) + 1);
+  }
+  out.push("## Levels");
+  for (const [l, n] of [...byLevel.entries()].sort((a, b) => a[0] - b[0])) {
+    out.push(line(`level ${l}`, n === 1 ? "1 node" : `${n} nodes`, `each stands for ${2 ** l} messages`));
+  }
+  out.push("");
+  out.push(`## Nodes (${keys.length})`);
+  for (const key of keys.slice(-maxNodes).reverse()) {
+    const [l, i] = key.split(":").map(Number);
+    const [start, stop] = C.covers(l!, i!);
+    const text = loaded.state.nodes.get(key)!;
+    const covers = stop - start === 1 ? `msg ${start}` : `msgs ${start}-${stop - 1}`;
+    out.push(`  L${l}  ${key.padEnd(8)}${pad(covers, 14)}${pad(fmtBytes(C.byteLen(text)), 9)}${C.oneLine(text).slice(0, 60)}`);
+  }
+  return out;
+}
+
+/** Kept for bin/measure.ts: the same numbers, no UI. */
+export function reportLines(snapshot: ChatSnapshot, g: Gains, opts: ReportOptions): string[] {
+  return statsLines(snapshot, g, {
+    ratio: opts.ratio,
+    budget: opts.budget,
+    prices: opts.prices ?? DEFAULT_PRICES,
+    usage: opts.usage,
+    paidUsd: opts.paidUsd,
+    windowTokens: opts.windowTokens,
+  });
 }
 
 export interface ReportOptions {
   ratio: number;
-  cacheRatio: number;
   budget: number;
+  prices?: Prices;
   usage?: RealUsage;
-}
-
-/** The lines shown in the popup and printed by bin/measure.ts. */
-export function reportLines(snapshot: ChatSnapshot, g: Gains, opts: ReportOptions): string[] {
-  const lines: string[] = [];
-  const pct = Math.round((snapshot.viewBytes / snapshot.budget) * 100);
-  lines.push(`session      ${snapshot.sessionID}`);
-  lines.push(`messages     ${snapshot.messages}   arbre ${snapshot.nodes} nœuds   ${snapshot.settled ? "à jour" : `${snapshot.unsettled} lignes en attente du compacteur`}`);
-  lines.push(`transcript   ${fmtBytes(snapshot.transcriptBytes)}`);
-  lines.push(`vue envoyée  ${fmtBytes(snapshot.sentBytes)}   (${snapshot.viewLines} lignes, ${pct}% du budget de ${fmtBytes(snapshot.budget)})`);
-  const compression = snapshot.transcriptBytes / Math.max(1, snapshot.sentBytes);
-  lines.push(`compression  ×${compression.toFixed(1)}  (transcript / vue)`);
-  lines.push(`ratio utilisé ${opts.ratio} octets/token  ·  cache à ${Math.round(opts.cacheRatio * 100)}% du prix`);
-  lines.push("");
-  lines.push("historique porté à chaque tour           full        optchat");
-  for (const s of g.samples) {
-    const p = `${Math.round(s.at * 100)}%`.padStart(4);
-    if (g.requests <= 1) break;
-    lines.push(`  ${p}                 ${fmtTokens(s.full).padStart(8)} tok  ${fmtTokens(s.ours).padStart(8)} tok   ×${(s.full / Math.max(1, s.ours)).toFixed(1)}`);
-  }
-  lines.push("");
-  lines.push(`dernier tour   full ${fmtTokens(g.last.full)} tok   →   optchat ${fmtTokens(g.last.ours)} tok`);
-  lines.push(`cumul session  full ${fmtTokens(g.cumulative.full)} tok   →   optchat ${fmtTokens(g.cumulative.ours)} tok   (×${(g.cumulative.full / Math.max(1, g.cumulative.ours)).toFixed(1)})`);
-  if (opts.usage && opts.usage.requests > 0) {
-    const u = opts.usage;
-    const billed = u.totals.input + u.totals.cache * opts.cacheRatio;
-    lines.push("");
-    lines.push(`réel (${u.requests} requêtes)   in ${fmtTokens(u.totals.input)} · cache ${fmtTokens(u.totals.cache)} · out ${fmtTokens(u.totals.output)}`);
-    lines.push(`dernier appel        in ${fmtTokens(u.last.input)} · cache ${fmtTokens(u.last.cache)} · out ${fmtTokens(u.last.output)}`);
-    lines.push(`facturé estimé       ${fmtTokens(billed)} tok équivalents (cache à ${Math.round(opts.cacheRatio * 100)}%)`);
-  }
-  if (snapshot.messages === 0) {
-    lines.push("");
-    lines.push("(aucune mémoire pour cette session : elle a démarré avant l'installation du plugin)");
-  }
-  return lines;
+  paidUsd?: number;
+  windowTokens?: number;
 }

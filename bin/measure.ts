@@ -25,11 +25,11 @@ if (!target) {
     if (!newest || info.mtimeMs > newest.mtime) newest = { name: entry.name, mtime: info.mtimeMs };
   }
   if (!newest) {
-    console.error(`aucun chat sous ${base} — lance une session avec le plugin d'abord`);
+    console.error(`no chat under ${base} — run a session with the plugin first`);
     process.exit(2);
   }
   target = newest.name;
-  console.error("(aucune session donnée : la plus récemment touchée)");
+  console.error("(no session given: the most recently touched one)");
 }
 
 const sessionID = target.includes("/") ? target.split("/").filter(Boolean).pop()! : target;
