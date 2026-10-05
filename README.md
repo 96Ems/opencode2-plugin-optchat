@@ -115,10 +115,18 @@ Prices come from the model catalogue (`ModelInfo.cost`, USD per million tokens).
 When the catalogue has no entry for the model — common with custom providers —
 they are **inferred from what the session actually cost**: every request is
 re-priced with the same ratios so that the "with optchat" column adds up to the
-invoice, which keeps the counterfactual comparable (the report says which of the
-two it used). The cache read price is what makes a long prefix cheap; that is why
-the old hand-entered "cache price" setting is gone. The summaries cost extra on
-top — one small model call per node — and the report says so.
+invoice, which keeps the counterfactual comparable. A catalogue entry that
+*disagrees* with the invoice is rescaled the same way (some providers ship
+nominal prices that bill several times less), and the report names the source it
+used: `catalogue`, `inferred` or `rescaled`. The cache read price is what makes a
+long prefix cheap; that is why the old hand-entered "cache price" setting is gone.
+The summaries cost extra on top — one small model call per node — and the report
+says so.
+
+Amounts are shown the way these models are priced: **cents per million tokens**
+for the prices, a **per-request row in cents**, and dollars only for session
+totals — a request costs a fraction of a cent, so dollars per million would hide
+how small the numbers are (0.16 ¢ a request against 0.86 ¢ carrying the whole log).
 
 The **full-transcript column is an upper bound**: past the model's context window
 OpenCode would have compacted, and the report warns when that point was reached
