@@ -25,6 +25,7 @@ import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import * as S from "./settings.ts";
 import * as C from "./core.ts";
 
 type AnyRec = Record<string, any>;
@@ -176,6 +177,7 @@ interface Chat {
   dir: string;
   state: C.ChatState;
   budget: number;
+  cap: number;
   owned: boolean;
   busy: Set<string>;
   failed: Map<string, number>;
@@ -196,19 +198,14 @@ export default {
     const INSTANCE = randomUUID().slice(0, 8);
     const options: AnyRec =
       ctx?.options && typeof ctx.options === "object" ? ctx.options : {};
-    // Options come from the config's object form (`plugin: [{ package, options }]`);
-    // when the plugin is auto-loaded from the plugins directory there are none,
-    // so every option also has an OPTCHAT_* environment fallback.
-    const envView = Number(process.env.OPTCHAT_VIEW);
-    const budget: number =
-      Number(options.view) > 2000 ? Number(options.view) : envView > 2000 ? envView : C.VIEW;
+    // Settings live in <dataDir>/settings.json so the TUI popup can change them
+    // while this process runs: they are re-read on every turn (one stat() in the
+    // hot path). Options from the config's object form and OPTCHAT_* env vars are
+    // the fallbacks, handled inside settings.ts.
+    const readSettings = S.makeSettingsReader();
+    const boot = await readSettings();
     const dataDir: string =
-      typeof options.dataDir === "string" && options.dataDir
-        ? options.dataDir
-        : process.env.OPTCHAT_DATA_DIR ||
-          join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode", "optchat");
-    const forcedCompactor = parseModel(options.compactor) ?? parseModel(process.env.OPTCHAT_COMPACTOR);
-    const disabled = options.enabled === false || process.env.OPTCHAT_DISABLED === "1";
+      typeof options.dataDir === "string" && options.dataDir ? options.dataDir : S.dataDir();
 
     const session = ctx.session as AnyRec;
     const tool = ctx.tool as AnyRec;
@@ -289,14 +286,15 @@ export default {
           dir,
           owned,
           state: C.newChatState(),
-          budget,
+          budget: boot.view,
+          cap: boot.cap,
           busy: new Set(),
           failed: new Map(),
           processed: new Set(),
           pumpScheduled: false,
           pumping: false,
           handles: {},
-          model: forcedCompactor ?? model,
+          model: S.parseModel(boot.compactor) ?? model,
           notified: new Set(),
           rows: [],
         };
@@ -476,7 +474,7 @@ export default {
         if (chat.processed.has(key)) continue;
         chat.processed.add(key);
         const date = new Date().toISOString();
-        for (const entry of C.decompose(msg as C.IncomingMessage, date, chat.state.messages.length, C.CAP)) {
+        for (const entry of C.decompose(msg as C.IncomingMessage, date, chat.state.messages.length, chat.cap)) {
           const record = { ...entry, src: key, inst: INSTANCE };
           chat.state.messages.push({ i: chat.state.messages.length, ...entry });
           const part: C.Part = { l: 0, i: chat.state.messages.length - 1 };
@@ -491,15 +489,15 @@ export default {
 
     // ------------------------------------------------------------ the turn
 
-    function capToolResults(message: AnyRec): AnyRec {
+    function capToolResults(message: AnyRec, cap: number): AnyRec {
       const content = Array.isArray(message.content) ? message.content : [];
       let changed = false;
       const next = content.map((part: AnyRec) => {
         if (part?.type !== "tool-result" || part.result === undefined) return part;
         const text = C.resultText(part.result);
-        if (C.byteLen(text) <= C.CAP) return part;
+        if (C.byteLen(text) <= cap) return part;
         changed = true;
-        return { ...part, result: { type: "text", value: C.resultText({ type: "text", value: text.slice(0, C.CAP) }) + `\n[... ${C.byteLen(text) - C.CAP} bytes cut ...]` } };
+        return { ...part, result: { type: "text", value: C.resultText({ type: "text", value: text.slice(0, cap) }) + `\n[... ${C.byteLen(text) - cap} bytes cut ...]` } };
       });
       return changed ? { ...message, content: next } : message;
     }
@@ -528,7 +526,7 @@ export default {
           ...attachments,
         ],
       };
-      const tail = messages.slice(lastUser + 1).map(capToolResults);
+      const tail = messages.slice(lastUser + 1).map((m) => capToolResults(m, chat.cap));
       return [head, ...tail];
     }
 
@@ -536,7 +534,8 @@ export default {
 
     await session.hook("context", async (event: AnyRec) => {
       try {
-        if (disabled) return;
+        const settings = await readSettings();
+        if (!settings.enabled) return;
         const messages: AnyRec[] = Array.isArray(event.messages) ? event.messages : [];
         if (!messages.length) return;
         const model = event.model;
@@ -552,6 +551,15 @@ export default {
           return;
         }
         holdLease(chat.dir, INSTANCE);
+
+        // settings can change while this process runs (TUI popup, hand edit)
+        chat.cap = settings.cap;
+        if (settings.view !== chat.budget) {
+          chat.budget = settings.view;
+          C.fit(chat.state, chat.budget);
+        }
+        const compactor = S.parseModel(settings.compactor);
+        if (compactor) chat.model = compactor;
 
         const newTurn = messages[messages.length - 1]?.role === "user";
         if (newTurn) {
@@ -589,7 +597,7 @@ export default {
     // OpenCode's own compaction: answer from our memory, no model call.
     await session.hook("compaction", async (event: AnyRec) => {
       try {
-        if (disabled) return;
+        if (!(await readSettings()).enabled) return;
         const chat = await getChat(String(event.sessionID));
         if (!chat.owned || !isOwner(chat.dir, INSTANCE)) return;
         await ingest(chat, Array.isArray(event.messages) ? event.messages : []);
@@ -657,17 +665,4 @@ export default {
   },
 };
 
-function parseModel(value: unknown): { providerID: string; id: string } | undefined {
-  if (value && typeof value === "object") {
-    const ref = value as AnyRec;
-    if (typeof ref.providerID === "string" && typeof (ref.id ?? ref.modelID) === "string") {
-      return { providerID: ref.providerID, id: String(ref.id ?? ref.modelID) };
-    }
-    return undefined;
-  }
-  if (typeof value === "string" && value.includes("/")) {
-    const [providerID, ...rest] = value.split("/");
-    return { providerID: providerID!, id: rest.join("/") };
-  }
-  return undefined;
-}
+

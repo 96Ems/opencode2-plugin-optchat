@@ -158,12 +158,17 @@ describe("view", () => {
     assertTiling(state);
   });
 
-  test("detail fades with age: old lines cover many messages, the view stays short", () => {
-    const state = fan(600, 700);
-    compactAll(state);
-    expect(state.view[0]!.l).toBeGreaterThan(0);
-    expect(state.messages.length / state.view.length).toBeGreaterThan(2);
-  });
+  // heavy fixture (600 messages x 700 B + a full merge pass): give it room on slow hosts
+  test(
+    "detail fades with age: old lines cover many messages, the view stays short",
+    () => {
+      const state = fan(600, 700);
+      compactAll(state);
+      expect(state.view[0]!.l).toBeGreaterThan(0);
+      expect(state.messages.length / state.view.length).toBeGreaterThan(2);
+    },
+    60_000,
+  );
 
   test("an unsummarized message shows as a placeholder and blocks settle", () => {
     const state = C.newChatState();

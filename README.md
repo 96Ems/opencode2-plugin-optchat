@@ -62,6 +62,30 @@ environment variables otherwise — handy since a directory install has no
 one `write` then `fsync`. A torn line (crash mid-write) is reported and skipped
 at load; the log is history and is never edited.
 
+## TUI plugin — popup and widget
+
+Load it with the rest of the plugin directory (same folder: `index.ts` is the
+server side, `tui.ts` the CLI side — both are picked up automatically).
+
+- **`/optchat`** ouvre un popup navigable (↑/↓ puis Entrée, taper pour filtrer,
+  Échap pour fermer) :
+  - **Stats de la session** — transcript vs vue, compression, historique porté à
+    chaque tour (×N), tokens réels (`in` / `cache` / `out`) tels que le provider
+    les facture ;
+  - **Vue** — exactement la chaîne envoyée au modèle ce tour-là ;
+  - **Arbre** — les résumés par niveau, avec la plage de messages et la taille ;
+  - **Réglages** — activer/désactiver, modèle de compaction (liste des modèles du
+    projet), budget de vue, cap par résultat d'outil, ratio octets/token, prix du
+    cache.
+- **widget de barre latérale** : `optchat · N msg · vue X Ko · ×Y` (et
+  `· Z en attente` quand le compacteur a du retard).
+- Raccourcis directs : `/optchat stats`, `/optchat view`, `/optchat tree`,
+  `/optchat settings`, `/optchat on`, `/optchat off`.
+
+Les réglages sont écrits dans `<dataDir>/settings.json` ; le plugin serveur
+relit ce fichier **à chaque tour** (un `stat()`), donc un changement depuis le
+popup s'applique au message suivant — sans redémarrer le service.
+
 ## Browsing
 
 ```bash
