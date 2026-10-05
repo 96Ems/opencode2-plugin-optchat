@@ -127,6 +127,11 @@ bun test
 nodes, in-order compaction, the fold (budget, tiling, monotonicity), zoom,
 prompt assembly, message decomposition and capping.
 
+## License
+
+MIT — see [LICENSE](LICENSE). The design follows VictorTaelin's OptChat spec
+("OptChat: an endless chat where the AI remembers everything").
+
 ## Known limits
 
 - Sessions are per-chat: each OpenCode session gets its own memory (a subagent
