@@ -243,10 +243,20 @@ describe("money", () => {
       totals: { input: 5, cache: 100, output: 7 },
       series: [{ input: 5, cache: 100, output: 7 }],
     };
-    const c = St.costs([{ full: 900_000, ours: 900_000 }], { prices, usage, paidUsd: 0.001 });
+    // catalogue prices that do match the invoice: used as they are
+    const exact = (5 / 1e6) * 1 + (100 / 1e6) * 0.1 + (7 / 1e6) * 10;
+    const c = St.costs([{ full: 900_000, ours: 900_000 }], { prices, usage, paidUsd: exact });
     expect(c.measuredWith).toBe(true);
-    expect(c.with.usd).toBeCloseTo((5 / 1e6) * 1 + (100 / 1e6) * 0.1 + (7 / 1e6) * 10, 9);
-    expect(c.savedUsd).toBeCloseTo(c.without.usd - 0.001, 9);
+    expect(c.priceSource).toBe("catalogue");
+    expect(c.with.usd).toBeCloseTo(exact, 9);
+    expect(c.savedUsd).toBeCloseTo(c.without.usd - exact, 9);
+
+    // catalogue prices that do not match it: rescaled, so the columns stay comparable
+    const off = St.costs([{ full: 900_000, ours: 900_000 }], { prices, usage, paidUsd: 0.001 });
+    expect(off.priceSource).toBe("rescaled");
+    expect(off.with.usd).toBeCloseTo(0.001, 9);
+    expect(off.savedUsd).toBeCloseTo(off.without.usd - 0.001, 9);
+    expect(off.prices.input).toBeGreaterThan(prices.input); // the invoice was higher
   });
 
   test("counts the requests that would not have fitted the window", () => {
@@ -401,5 +411,45 @@ describe("inferred prices", () => {
   test("no invoice, no derivation", () => {
     expect(St.effectivePrices(St.DEFAULT_PRICES, undefined, 3).derived).toBe(false);
     expect(St.effectivePrices(St.DEFAULT_PRICES, { requests: 0, last: { input: 0, cache: 0, output: 0 }, totals: { input: 0, cache: 0, output: 0 }, series: [] }, 3).derived).toBe(false);
+  });
+});
+
+describe("cost wording", () => {
+  test("the block says where the prices come from and that the counterfactual is an upper bound", async () => {
+    const dir = join(home, "ses_c");
+    await fs.mkdir(join(dir, "main"), { recursive: true });
+    const rows = Array.from({ length: 4 }, (_, i) => {
+      const kind = i % 2 === 0 ? "user" : "talk";
+      const text = `${i} ` + "q".repeat(3000);
+      return { i, kind, text, size: C.byteLen(`${kind}: ${text}`), date: "2026-10-05" };
+    });
+    await fs.writeFile(join(dir, "main", "2026-10-05.jsonl"), rows.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const loaded = await St.loadChatDir(dir, 3_000);
+    const g = St.gains("ses_c", loaded, loaded.rows, 1.3);
+    const usage: St.RealUsage = {
+      requests: 2,
+      last: { input: 100, cache: 900, output: 10 },
+      totals: { input: 200, cache: 1_800, output: 20 },
+      series: [
+        { input: 100, cache: 900, output: 10 },
+        { input: 100, cache: 900, output: 10 },
+      ],
+    };
+    const text = St.statsLines(loaded.snapshot, g, {
+      ratio: 1.3,
+      budget: 3_000,
+      prices: St.DEFAULT_PRICES,
+      usage,
+      paidUsd: 0.02,
+      windowTokens: 1_000,
+    }).join("\n");
+
+    expect(text).toContain("full transcript");
+    expect(text).toContain("optchat · paid");
+    expect(text).toContain("inferred from the $0.020 this session cost");
+    expect(text).toContain("upper bound");
+    // the paid column must land on the invoice
+    const c = St.costs(g.series, { prices: St.DEFAULT_PRICES, usage, paidUsd: 0.02 });
+    expect(c.with.usd).toBeCloseTo(0.02, 6);
   });
 });

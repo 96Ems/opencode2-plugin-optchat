@@ -281,6 +281,19 @@ export default Plugin.define({
         windowTokens: entry.windowTokens,
       });
       const compression = entry.snapshot.transcriptBytes / Math.max(1, entry.snapshot.sentBytes);
+      try {
+        const c = St.costs(entry.gains.series, {
+          prices: entry.prices,
+          usage: entry.usage,
+          paidUsd: entry.paidUsd,
+          windowTokens: entry.windowTokens,
+        });
+        log(
+          `cost ${sessionID}: prices ${c.priceSource} in $${c.prices.input.toFixed(4)}/M · paid ${entry.paidUsd ?? "-"} · full ${c.without.usd.toFixed(3)} · with ${c.with.usd.toFixed(3)} · saved ${c.savedUsd.toFixed(3)}`,
+        );
+      } catch (err) {
+        log(`cost log failed: ${String(err)}`);
+      }
       showReport(
         `optchat — stats · ${entry.snapshot.messages} messages · ×${compression.toFixed(1)} compression`,
         lines,

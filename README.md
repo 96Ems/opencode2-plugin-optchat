@@ -120,6 +120,11 @@ two it used). The cache read price is what makes a long prefix cheap; that is wh
 the old hand-entered "cache price" setting is gone. The summaries cost extra on
 top — one small model call per node — and the report says so.
 
+The **full-transcript column is an upper bound**: past the model's context window
+OpenCode would have compacted, and the report warns when that point was reached
+(it names how many requests would have gone over). The "with optchat" column is
+anchored on what the session really cost, so it always adds up to the invoice.
+
 ## Browsing
 
 ```bash

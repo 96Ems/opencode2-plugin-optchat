@@ -340,20 +340,17 @@ export interface EffectivePrices extends Prices {
 }
 
 /**
- * Prices to bill with. The catalogue's when it has the model, otherwise inferred
- * from what the session actually cost: every request is re-priced with the same
- * ratios (cache read and output expressed in input prices) so that the "with
- * optchat" column adds up to the invoice and the counterfactual stays comparable.
+ * Rescale every price by one factor so that the measured side adds up to what
+ * the session really cost. The ratios between input, cache read and output are
+ * kept, only the scale changes — which is what makes the counterfactual
+ * comparable with the invoice.
  */
-export function effectivePrices(prices: Prices, usage?: RealUsage, paidUsd?: number): EffectivePrices {
-  const plain: EffectivePrices = { ...prices, derived: false };
-  if (prices.source === "catalogue" || !usage || usage.requests === 0) return plain;
-  if (typeof paidUsd !== "number" || !(paidUsd > 0) || !(prices.input > 0)) return plain;
-  const cacheRatio = prices.cacheRead / prices.input;
-  const outputRatio = prices.output / prices.input;
+export function scalePrices(prices: Prices, usage: RealUsage, paidUsd: number): Prices {
+  const cacheRatio = prices.input > 0 ? prices.cacheRead / prices.input : 0;
+  const outputRatio = prices.input > 0 ? prices.output / prices.input : 0;
   const equivalents =
     (usage.totals.input + cacheRatio * usage.totals.cache + outputRatio * usage.totals.output) / 1e6;
-  if (!(equivalents > 0)) return plain;
+  if (!(equivalents > 0) || !(prices.input > 0) || !(paidUsd > 0)) return prices;
   const scale = paidUsd / equivalents / prices.input;
   return {
     input: prices.input * scale,
@@ -361,9 +358,19 @@ export function effectivePrices(prices: Prices, usage?: RealUsage, paidUsd?: num
     cacheRead: prices.cacheRead * scale,
     cacheWrite: prices.cacheWrite * scale,
     model: prices.model,
-    source: "default",
-    derived: true,
+    source: prices.source,
   };
+}
+
+/**
+ * Prices to bill with: the catalogue's when it has the model, otherwise inferred
+ * from what the session actually cost.
+ */
+export function effectivePrices(prices: Prices, usage?: RealUsage, paidUsd?: number): EffectivePrices {
+  const plain: EffectivePrices = { ...prices, derived: false };
+  if (prices.source === "catalogue" || !usage || usage.requests === 0) return plain;
+  if (typeof paidUsd !== "number" || !(paidUsd > 0)) return plain;
+  return { ...scalePrices(prices, usage, paidUsd), derived: true };
 }
 
 export interface CostSide {
@@ -384,6 +391,8 @@ export interface CostEstimate {
   perTurn: { withoutUsd: number; withUsd: number };
   /** true when the "with optchat" column uses the provider's own numbers */
   measuredWith: boolean;
+  /** where the prices came from: the catalogue, inferred from the invoice, or rescaled because the two disagreed */
+  priceSource: "catalogue" | "inferred" | "rescaled" | "default";
   prices: Prices;
   /** requests whose counterfactual context would not fit the model window */
   overWindow: number;
@@ -406,7 +415,23 @@ export function costs(
 ): CostEstimate {
   const usage = opts.usage && opts.usage.requests > 0 ? opts.usage : undefined;
   const measured = Boolean(usage);
-  const p = effectivePrices(opts.prices, usage, opts.paidUsd);
+  const bill = (prices: Prices, t: { input: number; cache: number; output: number }) =>
+    (t.input / 1e6) * prices.input + (t.cache / 1e6) * prices.cacheRead + (t.output / 1e6) * prices.output;
+
+  // Prices must describe what this session really cost, or the two columns are not
+  // comparable: derive them when the catalogue has no entry, and rescale them when
+  // the catalogue's numbers disagree with the invoice by more than a quarter.
+  let priceSource: "catalogue" | "inferred" | "rescaled" | "default" =
+    opts.prices.source === "catalogue" ? "catalogue" : "default";
+  const payable = typeof opts.paidUsd === "number" && opts.paidUsd > 0;
+  if (usage && payable) {
+    const catalogueBill = bill(opts.prices, usage.totals);
+    const off = catalogueBill > 0 ? Math.abs(catalogueBill - opts.paidUsd!) / opts.paidUsd! : 1;
+    if (opts.prices.source !== "catalogue" || off > 0.25) {
+      priceSource = opts.prices.source === "catalogue" ? "rescaled" : "inferred";
+    }
+  }
+  const p = priceSource === "inferred" || priceSource === "rescaled" ? scalePrices(opts.prices, usage!, opts.paidUsd!) : opts.prices;
   const usd = (fresh: number, cached: number, output: number) =>
     (fresh / 1e6) * p.input + (cached / 1e6) * p.cacheRead + (output / 1e6) * p.output;
 
@@ -466,6 +491,7 @@ export function costs(
     savedPct: without.usd > 0 ? Math.max(0, Math.min(100, (savedUsd / without.usd) * 100)) : 0,
     perTurn,
     measuredWith: measured,
+    priceSource,
     prices: p,
     overWindow,
   };
@@ -587,30 +613,51 @@ export function statsLines(snapshot: ChatSnapshot, g: Gains, o: StatsOptions): s
   const c = costs(g.series, { prices: o.prices, usage: o.usage, paidUsd: o.paidUsd, windowTokens: o.windowTokens });
   out.push("");
   out.push("## Cost (estimate, USD)");
-  out.push(`  ${pad("", 20)}${pad("without optchat", 20)}with optchat`);
+  out.push("  the same session with every turn carrying the whole log vs what it really cost");
+  out.push(`  ${pad("", 20)}${pad("full transcript", 20)}optchat · paid`);
   out.push(`  ${pad("last turn", 20)}${pad(formatUsd(c.perTurn.withoutUsd), 20)}${formatUsd(c.perTurn.withUsd)}`);
   out.push(`  ${pad("whole session", 20)}${pad(formatUsd(c.without.usd), 20)}${formatUsd(c.with.usd)}`);
   out.push(`  ${pad("saved", 20)}${formatUsd(c.savedUsd)}  (${c.savedPct.toFixed(0)}% less)`);
-  out.push(line("prices", `${formatUsd(c.prices.input)}/M in · ${formatUsd(c.prices.cacheRead)}/M cache read · ${formatUsd(c.prices.output)}/M out`, ""));
-  const eff = effectivePrices(o.prices, o.usage, o.paidUsd);
   out.push(
     line(
-      "model",
-      c.prices.model || "(unknown)",
-      eff.derived
-        ? `prices inferred from the ${formatUsd(o.paidUsd ?? 0)} this session cost`
-        : c.prices.source === "catalogue"
-          ? "prices from the model catalogue"
-          : "built-in default prices (no catalogue entry)",
+      "prices",
+      `${formatUsd(c.prices.input)}/M in · ${formatUsd(c.prices.cacheRead)}/M cache read · ${formatUsd(c.prices.output)}/M out`,
+      "",
     ),
   );
+  const catalogueBill =
+    o.usage && o.usage.requests > 0
+      ? (o.usage.totals.input / 1e6) * o.prices.input +
+        (o.usage.totals.cache / 1e6) * o.prices.cacheRead +
+        (o.usage.totals.output / 1e6) * o.prices.output
+      : undefined;
+  const paidText = formatUsd(o.paidUsd ?? 0);
+  out.push(
+    "        " +
+      (c.priceSource === "inferred"
+        ? `inferred from the ${paidText} this session cost, so the paid column lands on your invoice`
+        : c.priceSource === "rescaled"
+          ? `the catalogue bills ${formatUsd(catalogueBill ?? 0)} for these tokens but you paid ${paidText}: prices rescaled to your invoice`
+          : c.priceSource === "catalogue"
+            ? `from the model catalogue (${c.prices.model})`
+            : "built-in defaults: no catalogue price and no invoice to derive from"),
+  );
+  if (c.prices.model) out.push(line("model", c.prices.model, ""));
   out.push(line("method", "unchanged prefix cached", ""));
   out.push("        every request bills the new tail fresh and serves the prefix from the cache;");
   out.push("        answers count the same on both sides, so the gap is the size of the context.");
   out.push("        the summaries themselves cost extra: one small call per summary node.");
-  if (c.overWindow > 0 && o.windowTokens) {
-    const w = fmtTokens(o.windowTokens);
-    out.push(`⚠  ${c.overWindow} of ${c.requests} requests would not have fit the ${w} token window without optchat`);
+  const biggest = g.maxFull;
+  if (o.windowTokens && c.overWindow > 0) {
+    out.push(
+      `⚠  ${c.overWindow} of ${c.requests} requests would have exceeded the ${fmtTokens(o.windowTokens)} token window:`,
+    );
+    out.push(`   without optchat OpenCode would have had to compact, so the full-transcript column is an upper bound`);
+  } else if (!o.windowTokens && biggest > 200_000) {
+    out.push(`⚠  the fullest request carries ${fmtTokens(biggest)} tokens; past the model window compaction would run,`);
+    out.push(`   so the full-transcript column is an upper bound (window unknown: model not in the catalogue)`);
+  } else if (!o.windowTokens) {
+    out.push(`  window unknown (model not in the catalogue) · fullest request ${fmtTokens(biggest)} tokens`);
   }
 
   if (o.usage && o.usage.requests > 0) {
