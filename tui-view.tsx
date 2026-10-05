@@ -532,30 +532,38 @@ export default Plugin.define({
       });
     };
 
-    const off = ctx.keymap.layer(() => ({
-      mode: "global",
-      commands: [
-        {
-          id: "optchat.menu",
-          title: "optchat: memory, stats, settings",
-          group: "optchat",
-          palette: true,
-          suggested: true,
-          slash: { name: "optchat", aliases: ["oc"] },
-          run: () => {
-            log(`cmd /optchat (route ${routeNow()?.type ?? "?"})`);
-            return void guard((id) => menu(id), "menu");
-          },
-        },
-        { id: "optchat.stats", title: "optchat: session stats", group: "optchat", slash: { name: "optchat_stats" }, run: () => void guard((id) => showStats(id), "stats") },
-        { id: "optchat.view", title: "optchat: view sent to the model", group: "optchat", slash: { name: "optchat_view" }, run: () => void guard((id) => showView(id), "view") },
-        { id: "optchat.tree", title: "optchat: summary tree", group: "optchat", slash: { name: "optchat_tree" }, run: () => void guard((id) => showTree(id), "tree") },
-        { id: "optchat.raw", title: "optchat: raw context string", group: "optchat", slash: { name: "optchat_raw" }, run: () => void guard((id) => showRaw(id), "raw") },
-        { id: "optchat.settings", title: "optchat: settings", group: "optchat", slash: { name: "optchat_settings" }, run: () => void showSettings().catch((err) => log(`error settings: ${String(err)}`)) },
-        { id: "optchat.on", title: "optchat: turn memory on", group: "optchat", slash: { name: "optchat_on" }, run: () => void toggle(true) },
-        { id: "optchat.off", title: "optchat: turn memory off", group: "optchat", slash: { name: "optchat_off" }, run: () => void toggle(false) },
-      ],
-    }));
+    // ---------------------------------------------------------------- keymap slot
+    // Must wrap keymap.layer() in a ui.slot() render so Keymap.Provider is available
+    ctx.ui.slot({
+      append: "app",
+      render() {
+        ctx.keymap.layer(() => ({
+          mode: "global",
+          commands: [
+            {
+              id: "optchat.menu",
+              title: "optchat: memory, stats, settings",
+              group: "optchat",
+              palette: true,
+              suggested: true,
+              slash: { name: "optchat", aliases: ["oc"] },
+              run: () => {
+                log(`cmd /optchat (route ${routeNow()?.type ?? "?"})`);
+                return void guard((id) => menu(id), "menu");
+              },
+            },
+            { id: "optchat.stats", title: "optchat: session stats", group: "optchat", slash: { name: "optchat_stats" }, run: () => void guard((id) => showStats(id), "stats") },
+            { id: "optchat.view", title: "optchat: view sent to the model", group: "optchat", slash: { name: "optchat_view" }, run: () => void guard((id) => showView(id), "view") },
+            { id: "optchat.tree", title: "optchat: summary tree", group: "optchat", slash: { name: "optchat_tree" }, run: () => void guard((id) => showTree(id), "tree") },
+            { id: "optchat.raw", title: "optchat: raw context string", group: "optchat", slash: { name: "optchat_raw" }, run: () => void guard((id) => showRaw(id), "raw") },
+            { id: "optchat.settings", title: "optchat: settings", group: "optchat", slash: { name: "optchat_settings" }, run: () => void showSettings().catch((err) => log(`error settings: ${String(err)}`)) },
+            { id: "optchat.on", title: "optchat: turn memory on", group: "optchat", slash: { name: "optchat_on" }, run: () => void toggle(true) },
+            { id: "optchat.off", title: "optchat: turn memory off", group: "optchat", slash: { name: "optchat_off" }, run: () => void toggle(false) },
+          ],
+        }));
+        return null;
+      },
+    });
 
     // ---------------------------------------------------------------- widget
 
@@ -616,6 +624,5 @@ export default Plugin.define({
     }
 
     log(`loaded (settings ${S.settingsPath()}, home ${homedir()})`);
-    return () => off?.();
   },
 });
