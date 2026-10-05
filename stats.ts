@@ -404,62 +404,67 @@ export function costs(
   series: { full: number; ours: number }[],
   opts: { prices: Prices; usage?: RealUsage; paidUsd?: number; windowTokens?: number },
 ): CostEstimate {
-  const usage = opts.usage && opts.usage.series.length === series.length ? opts.usage : undefined;
+  const usage = opts.usage && opts.usage.requests > 0 ? opts.usage : undefined;
   const measured = Boolean(usage);
-  const p = effectivePrices(opts.prices, measured ? usage : undefined, opts.paidUsd);
+  const p = effectivePrices(opts.prices, usage, opts.paidUsd);
   const usd = (fresh: number, cached: number, output: number) =>
     (fresh / 1e6) * p.input + (cached / 1e6) * p.cacheRead + (output / 1e6) * p.output;
 
+  // "without optchat": walk the series, the prefix of every request is cached
   const without: CostSide = { fresh: 0, cached: 0, output: 0, usd: 0 };
-  const side: CostSide = { fresh: 0, cached: 0, output: 0, usd: 0 };
+  const modelledWith: CostSide = { fresh: 0, cached: 0, output: 0, usd: 0 };
   let overWindow = 0;
-  let lastTurn = { withoutUsd: 0, withUsd: 0 };
+  let lastFull = { fresh: 0, cached: 0 };
+  let lastView = { fresh: 0, cached: 0 };
 
   for (let i = 0; i < series.length; i++) {
     const full = series[i]!.full;
-    const ours = series[i]!.ours;
-    const out = measured ? usage!.series[i]!.output : 0;
-
     const prevFull = i > 0 ? series[i - 1]!.full : 0;
-    const wFresh = Math.max(0, full - prevFull) + (i === 0 ? 0 : 0);
-    const wCached = Math.min(prevFull, full);
-    without.fresh += wFresh;
-    without.cached += wCached;
-    without.output += out;
+    const fresh = Math.max(0, full - prevFull);
+    const cached = Math.min(prevFull, full);
+    without.fresh += fresh;
+    without.cached += cached;
+    lastFull = { fresh, cached };
     if (opts.windowTokens && full > opts.windowTokens) overWindow++;
 
-    let cFresh: number;
-    let cCached: number;
-    let cOut: number;
-    if (measured) {
-      const row = usage!.series[i]!;
-      cFresh = row.input;
-      cCached = row.cache;
-      cOut = row.output;
-    } else {
-      const prevOurs = i > 0 ? series[i - 1]!.ours : 0;
-      cFresh = Math.max(0, ours - prevOurs);
-      cCached = Math.min(prevOurs, ours);
-      cOut = out;
-    }
-    side.fresh += cFresh;
-    side.cached += cCached;
-    side.output += cOut;
-    lastTurn = { withoutUsd: usd(wFresh, wCached, out), withUsd: usd(cFresh, cCached, cOut) };
+    const ours = series[i]!.ours;
+    const prevOurs = i > 0 ? series[i - 1]!.ours : 0;
+    lastView = { fresh: Math.max(0, ours - prevOurs), cached: Math.min(prevOurs, ours) };
+    modelledWith.fresh += lastView.fresh;
+    modelledWith.cached += lastView.cached;
   }
 
+  // outputs are the same on both sides, so they never explain the gap
+  const answers = usage ? usage.totals.output : 0;
+  without.output = answers;
+  modelledWith.output = answers;
+
+  // "with optchat": the provider's own counts when the session carries them
+  const withSide: CostSide = measured
+    ? { fresh: usage!.totals.input, cached: usage!.totals.cache, output: answers, usd: 0 }
+    : { fresh: modelledWith.fresh, cached: modelledWith.cached, output: answers, usd: 0 };
+
   without.usd = usd(without.fresh, without.cached, without.output);
-  side.usd = usd(side.fresh, side.cached, side.output);
-  const billedWith = typeof opts.paidUsd === "number" ? opts.paidUsd : side.usd;
+  withSide.usd = usd(withSide.fresh, withSide.cached, withSide.output);
+
+  const lastOut = usage ? usage.last.output : 0;
+  const perTurn = measured
+    ? { withoutUsd: usd(lastFull.fresh, lastFull.cached, lastOut), withUsd: usd(usage!.last.input, usage!.last.cache, usage!.last.output) }
+    : {
+        withoutUsd: usd(lastFull.fresh, lastFull.cached, lastOut),
+        withUsd: usd(lastView.fresh, lastView.cached, lastOut),
+      };
+
+  const billedWith = typeof opts.paidUsd === "number" ? opts.paidUsd : withSide.usd;
   const savedUsd = without.usd - billedWith;
 
   return {
-    requests: series.length,
+    requests: Math.max(series.length, usage?.requests ?? 0),
     without,
-    with: side,
+    with: withSide,
     savedUsd,
     savedPct: without.usd > 0 ? Math.max(0, Math.min(100, (savedUsd / without.usd) * 100)) : 0,
-    perTurn: lastTurn,
+    perTurn,
     measuredWith: measured,
     prices: p,
     overWindow,
