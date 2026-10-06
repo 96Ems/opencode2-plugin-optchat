@@ -87,6 +87,7 @@ describe("orchestrator gating", () => {
       collect: {},
       status: {},
       stop: {},
+      note: {},
       find: {},
       zoom: {},
       date: {},
@@ -138,6 +139,24 @@ describe("orchestrator renderings stay bounded", () => {
     expect(O.findLines(rows, "8787", 1)).toHaveLength(1);
     expect(O.findLines(rows, "   ")).toHaveLength(0);
     expect(O.findLines(rows, "PORT")).toHaveLength(2);
+  });
+
+  test("note normalises a run reported by hand, and refuses a bad event or a missing id", () => {
+    const ok = O.noteEvent("ses_a", "add the retry logic", "DONE", "3 files, tests green", 42);
+    expect(typeof ok).not.toBe("string");
+    const event = ok as O.RunEvent;
+    expect(event.event).toBe("done");
+    expect(event.id).toBe("ses_a");
+    expect(event.result).toContain("tests green");
+    expect(event.at).toBe(42);
+
+    // the ledger must stay a ledger: anything else is answered, not appended
+    expect(O.noteEvent("ses_a", "x", "finished")).toContain("spawned, resumed, done, failed, stopped");
+    expect(O.noteEvent("  ", "x", "done")).toContain("id");
+    // a missing event means "done", and a missing subject is labelled, never empty
+    const bare = O.noteEvent("ses_b", "", undefined) as O.RunEvent;
+    expect(bare.event).toBe("done");
+    expect(bare.task).toBe("(unknown)");
   });
 });
 

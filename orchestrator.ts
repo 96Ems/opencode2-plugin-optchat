@@ -56,6 +56,11 @@ Running a subagent
 - One subagent per independent subject. Several subjects? Spawn several in the
   same turn: they run in parallel, and their context is not charged to yours —
   only their return is.
+- The harness may ship its own subagent tool: on OpenCode v2 that tool is task,
+  and it takes the agent to run (and a prompt). Prefer it when it exists — it
+  starts the run natively and resolves the model from the agent's own
+  configuration — and then record the run yourself with note(id, task, ...).
+  spawn is the fallback.
 - Every brief must be self-contained. The subagent sees nothing of this
   conversation and nothing of your other subagents. Give it: the goal, the exact
   paths, the constraints, what must not break, and the shape of the report you
@@ -187,8 +192,33 @@ export function spawnedIds(events: readonly RunEvent[]): string[] {
   return [...new Set(events.map((e) => e.id))];
 }
 
+/** The run events an orchestrator may report by hand. */
+export const EVENTS: ReadonlyArray<RunEvent["event"]> = ["spawned", "resumed", "done", "failed", "stopped"];
+
+function isEvent(value: string): value is RunEvent["event"] {
+  return (EVENTS as readonly string[]).includes(value);
+}
+
+/**
+ * Normalise what the orchestrator reports about a run it started with the
+ * harness's own subagent tool: the ledger must stay a ledger, whatever the model
+ * passes. Returns the event to append, or a message explaining what is wrong.
+ */
+export function noteEvent(id: string, task: string, event: unknown, result?: unknown, at = Date.now()): RunEvent | string {
+  const name = String(event ?? "done").trim().toLowerCase();
+  if (!isEvent(name)) return `note needs an event among: ${EVENTS.join(", ")}.`;
+  if (!String(id ?? "").trim()) return "note needs the id of the subagent the harness gave you.";
+  return {
+    id: String(id).trim(),
+    task: oneLine(String(task ?? "").trim() || "(unknown)", 120),
+    event: name,
+    ...(result ? { result: oneLine(String(result), 300) } : {}),
+    at,
+  };
+}
+
 /** The tools the orchestrator is allowed to see. Everything else is hidden from it. */
-export const TOOL_NAMES = ["spawn", "collect", "status", "stop", "find", "zoom", "date"] as const;
+export const TOOL_NAMES = ["spawn", "collect", "status", "stop", "note", "find", "zoom", "date"] as const;
 
 /** Keep only the orchestrator's tools in the set offered to the model. */
 export function filterTools<T extends Record<string, unknown>>(tools: T): T {

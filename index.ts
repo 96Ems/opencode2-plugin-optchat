@@ -925,6 +925,42 @@ export default {
       });
 
       editor.add({
+        name: "note",
+        description:
+          "Record one line in the run ledger for a subagent you started with the harness's own tool. The ledger is the only memory you keep: call this right after every start, and again when a run ends.",
+        input: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "The subagent session id." },
+            task: { type: "string", description: "The one-line subject." },
+            event: {
+              type: "string",
+              description: `One of: ${O.EVENTS.join(", ")}. Default done.`,
+            },
+            result: { type: "string", description: "One line on what it returned, when it ended." },
+          },
+          required: ["id", "task"],
+          additionalProperties: false,
+        },
+        execute: async (args: AnyRec, tctx: AnyRec) => {
+          if (!O.allowed(tctx?.agent)) return { content: O.refused(tctx?.agent) };
+          const event = O.noteEvent(
+            String(args?.id ?? ""),
+            String(args?.task ?? ""),
+            args?.event,
+            args?.result,
+          );
+          if (typeof event === "string") return { content: event };
+          try {
+            await appendLedger(dataDir, { ...event, parent: String(tctx.sessionID) });
+            return { content: `noted: ${O.ledgerLine(event)}` };
+          } catch (err) {
+            return { content: `note failed: ${String(err)}` };
+          }
+        },
+      });
+
+      editor.add({
         name: "find",
         description:
           "Search this conversation's own log, word for word, before asking a subagent for something you already have. Returns lines; zoom(id, 1) opens one whole.",
