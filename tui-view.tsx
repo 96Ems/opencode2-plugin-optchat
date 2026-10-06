@@ -364,6 +364,15 @@ export default Plugin.define({
               : "the view becomes the context of every turn again",
           },
           {
+            title: settings.orchestrator
+              ? "Orchestrator: on — turn it off"
+              : "Orchestrator: off — turn it on",
+            value: "orchestrator",
+            description: settings.orchestrator
+              ? 'the "orchestrator" agent gets the subagent tools and the workflow; other agents are untouched'
+              : 'one conversation driving many subagents — its own context is never rewritten, so the cache holds. Declare the "orchestrator" agent in opencode.jsonc first.',
+          },
+          {
             title: `Compactor model — ${S.formatModel(settings.compactor)}`,
             value: "compactor",
             description: "the model that writes summaries; applies from the next turn",
@@ -401,6 +410,17 @@ export default Plugin.define({
           title: "optchat",
           message: next.enabled ? "memory on" : "memory off",
           variant: next.enabled ? "success" : "warning",
+        });
+        return showSettings();
+      }
+      if (choice === "orchestrator") {
+        const next = await S.writeSettings({ orchestrator: !settings.orchestrator });
+        ctx.ui.toast.show({
+          title: "optchat",
+          message: next.orchestrator
+            ? "orchestrator on — declare the agent, then open a session as it"
+            : "orchestrator off",
+          variant: next.orchestrator ? "success" : "warning",
         });
         return showSettings();
       }

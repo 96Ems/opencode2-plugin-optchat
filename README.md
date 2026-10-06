@@ -282,6 +282,24 @@ MIT — see [LICENSE](LICENSE). The design follows VictorTaelin's OptChat spec
 
 ## Known limits
 
+- **Orchestrator mode — what is verified, and what is not.** Driving subagents has
+  been exercised on a live harness (OpenCode v2.0.x, Linux, `muse-spark-1.3`):
+
+  - **Works.** The workflow is injected and actually respected: the model refuses
+    to do the work itself, reports verbatim, and never presents a result it did
+    not collect (`collect` answered "still running" three times in a row while
+    that was true). The ledger records `spawned` / `resumed` / `stopped` with
+    their parent, `status` / `collect` / `stop` answer, and the gating holds.
+  - **Not working yet.** A session created by `spawn` is created and prompted but
+    never runs: it stays `running`, and the provider log shows the model it fell
+    back to is unavailable in this region. Passing `agent` and `model` to
+    `session.create` did not change that here. Note that v2 also ships its own
+    background `subagent` mechanism, and that one worked in the same session.
+    Aligning `spawn` with it — or finding the inbox/delivery flag that actually
+    dispatches a created session — is the next step. The plugin's value
+    (workflow, ledger, gating, and an orchestrator whose own context stays short
+    and cacheable) does not depend on which of the two starts the runs.
+
 - Sessions are per-chat: each OpenCode session gets its own memory (a subagent
   session gets its own too, which matches OptChat's rule that only the master's
   chat is the memory).

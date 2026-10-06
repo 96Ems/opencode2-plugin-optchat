@@ -47,9 +47,10 @@ export interface RunEvent {
  */
 export const WORKFLOW = `You orchestrate. You do not do the work yourself.
 
-Your tools are only the ones that drive subagents: spawn, collect, status, stop,
-find, zoom, date. You cannot edit files, run commands, or read the repository. If
-something needs doing, a subagent does it.
+Your tools are the ones that drive subagents: spawn, collect, status, stop, find,
+zoom, date. You cannot edit files, run commands, or read the repository — and if
+the harness also hands you a generic sandbox, its only legitimate use is to call
+the tools above. If something needs doing, a subagent does it.
 
 Running a subagent
 - One subagent per independent subject. Several subjects? Spawn several in the

@@ -235,6 +235,8 @@ interface Chat {
   handles: Record<string, Handle | undefined>;
   turnView?: string;
   model?: { providerID: string; id: string };
+  /** the model this session actually runs on: what a subagent inherits by default */
+  turnModel?: { providerID: string; id: string };
   notified: Set<string>;
   rows: Array<Record<string, unknown>>;
 }
@@ -599,6 +601,13 @@ export default {
             ? { providerID: String(model.providerID), id: String(model.id) }
             : undefined,
         );
+        // Remember what this session really runs on: a subagent we spawn inherits
+        // it, instead of falling back to a harness default that may not exist here
+        // (observed: the default was rejected by the provider, and the subagent
+        // session sat there failing while collect honestly reported "nothing yet").
+        if (model && typeof model.id === "string" && typeof model.providerID === "string") {
+          chat.turnModel = { providerID: String(model.providerID), id: String(model.id) };
+        }
         // ownership can move between instances in this process (e.g. after a reload)
         if (!chat.owned || !isOwner(chat.dir, INSTANCE)) {
           chat.owned = false;
@@ -769,15 +778,26 @@ export default {
                   "Refused: the brief is too short to be self-contained. Give the subagent the goal, the exact paths, the constraints, and the report shape you expect.",
               };
             }
-            const model = S.parseModel(String(args?.model ?? ""));
+            const model = S.parseModel(String(args?.model ?? "")) ?? (await getChat(String(tctx.sessionID))).turnModel;
+            // Always name an agent. A session created without one lands on the
+            // harness default agent, whose model may not even exist here (observed:
+            // every such subagent died on "this model is not available in your
+            // country"). `build` is the ordinary working agent.
             const created = (await session.create({
               title: O.oneLine(String(args?.title ?? task), 60),
-              ...(args?.agent ? { agent: String(args.agent) } : {}),
+              agent: String(args?.agent ?? "build"),
               ...(model ? { model } : {}),
             })) as AnyRec;
             const id = String(created?.id ?? "");
             if (!id) return { content: "spawn failed: the harness returned no session id." };
             await session.prompt({ sessionID: id, text: task });
+            // A created session can sit in the harness inbox instead of running:
+            // asking for background explicitly is what actually starts it.
+            try {
+              await session.background({ sessionID: id });
+            } catch {
+              // older harnesses have no background op; the prompt alone may do it
+            }
             await appendLedger(dataDir, {
               id,
               parent: String(tctx.sessionID),
