@@ -15,6 +15,17 @@ export const NODE = 512;
 export const VIEW = 128_000;
 export const CAP = 30_000;
 
+/**
+ * Messages covered by one frozen prefix line.
+ *
+ * The head of every payload is what a provider's prompt cache can reuse, so it
+ * is written once and never rewritten: whole aligned nodes of this level are
+ * appended to it, never edited. A smaller level would make the head grow faster
+ * (more cache-miss-free appends but a bigger head); a larger one would grow
+ * slower but cover less of the history with cached bytes.
+ */
+export const FREEZE_LEVEL = 4;
+
 export type Kind = "user" | "talk" | "tool" | "echo" | "note";
 
 export interface LogMsg {
@@ -40,10 +51,24 @@ export interface ChatState {
   /** the view: adjacent parts tiling messages [0, T), oldest first */
   view: Part[];
   viewBytes: number;
+  /** level of the frozen head, and how many of its aligned nodes are frozen */
+  frozenLevel: number;
+  frozenCount: number;
+  /** bytes of the frozen head, recomputed when it grows */
+  frozenBytes: number;
 }
 
 export function newChatState(): ChatState {
-  return { messages: [], nodes: new Map(), free: new Map(), view: [], viewBytes: 0 };
+  return {
+    messages: [],
+    nodes: new Map(),
+    free: new Map(),
+    view: [],
+    viewBytes: 0,
+    frozenLevel: FREEZE_LEVEL,
+    frozenCount: 0,
+    frozenBytes: 0,
+  };
 }
 
 // ---------------------------------------------------------------- byte utils
@@ -263,6 +288,90 @@ export function renderView(state: ChatState, mode: "placeholder" | "line" = "pla
     const n = span(part.l);
     return `${part.i * n}+${n}|${partText(state, part, mode)}`;
   });
+  return `<chat>\n${lines.join("\n")}\n</chat>`;
+}
+
+// -------------------------------------------------------------- the frozen head
+
+/** Messages covered by the frozen head: [0, frozenCovered). */
+export function frozenCovered(state: ChatState): number {
+  return state.frozenCount * span(state.frozenLevel);
+}
+
+/** The frozen head. Its lines are written once and never rewritten. */
+export function frozenLines(state: ChatState): string[] {
+  const l = state.frozenLevel;
+  const n = span(l);
+  const out: string[] = [];
+  for (let i = 0; i < state.frozenCount; i++) {
+    const text = nodeText(state, l, i);
+    if (text === undefined) break;
+    out.push(`${i * n}+${n}|${oneLine(text)}`);
+  }
+  return out;
+}
+
+function frozenBytesOf(state: ChatState): number {
+  return byteLen(frozenLines(state).join("\n"));
+}
+
+/**
+ * Extend the frozen head by every aligned node the compactor has finished, then
+ * checkpoint if the head outgrew its half of the budget.
+ *
+ * Appending is the whole point: an already-frozen line keeps the same bytes, so
+ * the new payload *starts* with the previous payload's head and a provider's
+ * prefix cache keeps hitting (measured effect: cache reads instead of a fresh
+ * prompt every turn). A checkpoint — moving one level up, halving the head — is
+ * the only operation that rewrites it, so it is paid once, rarely, and only when
+ * the new level's nodes already exist (otherwise the head would vanish).
+ */
+export function refreshFrozen(state: ChatState, budget = VIEW): void {
+  for (let guard = 0; guard < 24; guard++) {
+    const l = state.frozenLevel;
+    let n = state.frozenCount;
+    while (built(state, l, n) && (n + 1) * span(l) <= state.messages.length) n++;
+    state.frozenCount = n;
+    state.frozenBytes = frozenBytesOf(state);
+    if (state.frozenBytes <= budget / 2) return;
+    if (!built(state, l + 1, 0)) return;
+    state.frozenLevel = l + 1;
+    state.frozenCount = 0;
+  }
+}
+
+/** The live tail: `state.view` clipped to [from, T), splitting parts that straddle. */
+export function tailParts(state: ChatState, from: number): Part[] {
+  const out: Part[] = [];
+  const walk = (part: Part): void => {
+    const [start, stop] = covers(part.l, part.i);
+    if (stop <= from) return;
+    if (start >= from) {
+      out.push(part);
+      return;
+    }
+    if (part.l === 0) return;
+    walk({ l: part.l - 1, i: 2 * part.i });
+    walk({ l: part.l - 1, i: 2 * part.i + 1 });
+  };
+  for (const part of state.view) walk(part);
+  return out;
+}
+
+export function tailLines(state: ChatState, from = frozenCovered(state)): string[] {
+  return tailParts(state, from).map((part) => {
+    const n = span(part.l);
+    return `${part.i * n}+${n}|${partText(state, part, "line")}`;
+  });
+}
+
+/**
+ * The context a model call gets: a frozen head (identical bytes from one turn to
+ * the next) followed by the live tail. Same coverage as `renderView(state,
+ * "line")` — this is only a different *order* of the same lines.
+ */
+export function renderCached(state: ChatState): string {
+  const lines = [...frozenLines(state), ...tailLines(state)];
   return `<chat>\n${lines.join("\n")}\n</chat>`;
 }
 

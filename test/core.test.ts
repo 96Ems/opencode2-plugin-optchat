@@ -296,3 +296,79 @@ describe("decompose", () => {
     expect(C.resultText(undefined)).toBe("(no result)");
   });
 });
+
+describe("the frozen head keeps the prompt cache alive", () => {
+  const date = "2026-01-01T00:00:00Z";
+
+  /** A chat with `n` messages and every node the compactor would build. */
+  function grown(n: number, budget = C.VIEW): C.ChatState {
+    const state = C.newChatState();
+    for (let i = 0; i < n; i++) {
+      C.pushMessage(state, "user", `message ${i} of a long session, with a few words in it`, date);
+    }
+    compactAll(state);
+    C.refreshFrozen(state, budget);
+    return state;
+  }
+
+  const head = (state: C.ChatState) => `<chat>\n${C.frozenLines(state).join("\n")}`;
+
+  test("a payload starts with the previous payload's head (what the cache needs)", () => {
+    const state = grown(64);
+    for (let turn = 0; turn < 6; turn++) {
+      const before = C.renderCached(state);
+      const headBefore = head(state);
+      expect(before.startsWith(headBefore)).toBe(true);
+      C.pushMessage(state, "user", `turn ${turn}`, date);
+      compactAll(state);
+      C.refreshFrozen(state, C.VIEW);
+      expect(C.renderCached(state).startsWith(headBefore)).toBe(true);
+    }
+  });
+
+  test("freezing only appends: an already-written line is never rewritten", () => {
+    const state = grown(96);
+    const first = C.frozenLines(state);
+    for (let turn = 0; turn < 5; turn++) {
+      C.pushMessage(state, "user", `more ${turn}`, date);
+      compactAll(state);
+      C.refreshFrozen(state, C.VIEW);
+      const next = C.frozenLines(state);
+      expect(next.length).toBeGreaterThanOrEqual(first.length);
+      for (let i = 0; i < first.length; i++) expect(next[i]).toBe(first[i]);
+    }
+  });
+
+  test("frozen head + tail tile [0, T) exactly: no gap, no overlap, nothing lost", () => {
+    const state = grown(200);
+    const lines = [...C.frozenLines(state), ...C.tailLines(state)];
+    let at = 0;
+    for (const line of lines) {
+      const m = /^(\d+)\+(\d+)\|/.exec(line)!;
+      expect(Number(m[1])).toBe(at);
+      at += Number(m[2]);
+    }
+    expect(at).toBe(state.messages.length);
+  });
+
+  test("a long chat keeps most of its history inside the frozen head", () => {
+    const state = grown(600);
+    expect(C.frozenCovered(state)).toBeGreaterThan(500);
+    expect(state.frozenBytes).toBeLessThanOrEqual(C.VIEW / 2);
+  });
+
+  test("a head that outgrows its half of the budget checkpoints one level up", () => {
+    const state = C.newChatState();
+    for (let i = 0; i < 400; i++) C.pushMessage(state, "user", `m${i}`, date);
+    compactAll(state);
+    C.refreshFrozen(state, C.VIEW);
+    const before = C.frozenLines(state).length;
+    expect(before).toBeGreaterThan(0);
+    expect(state.frozenLevel).toBe(C.FREEZE_LEVEL);
+    C.refreshFrozen(state, 2_000);          // a tiny budget forces the checkpoint
+    expect(state.frozenLevel).toBeGreaterThan(C.FREEZE_LEVEL);
+    expect(state.frozenCount).toBeGreaterThan(0);
+    expect(C.frozenCovered(state)).toBeGreaterThan(0);
+    expect(C.frozenCovered(state)).toBeLessThanOrEqual(state.messages.length);
+  });
+});
