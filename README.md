@@ -20,6 +20,27 @@ the AI remembers everything"*) implemented as an OpenCode v2 server plugin:
 - **You can browse it.** The log and the tree are plain JSONL files, and
   `bin/optchat.ts` prints the view, every message and the whole tree.
 
+## The explainer film
+
+[media/optchat-v5.mp4](media/optchat-v5.mp4) — **2:26**, 1920x1080, 60 fps. Memory
+mode in one segment, then orchestrator mode: one chat holding the mission and a
+ledger, sub-agents fanning out, the loop with its tool panel and real
+`status` / `collect` calls.
+
+The script it was narrated from is committed next to it
+([media/script.json](media/script.json)): one JSON file, one `text` per clip.
+
+**To generate the film, use the psychopomp fork** — this repository only carries
+the result and the script, not the engine that turns them into video:
+
+- the scene, the recorded narration and the render commands:
+  [96Ems/psychopomp · scenes/optchat](https://github.com/96Ems/psychopomp/tree/main/scenes/optchat)
+- the full recipe (narration, reel, contact sheet, render, plus the two anchor
+  rules that keep biting):
+  [docs/THE_FILM.md](https://github.com/96Ems/psychopomp/blob/main/docs/THE_FILM.md)
+- the local TTS/STT stack it needs (Kokoro + Parakeet, no paid API):
+  [docs/LOCAL_TTS_STT.md](https://github.com/96Ems/psychopomp/blob/main/docs/LOCAL_TTS_STT.md)
+
 ## Install
 
 A plugin directory with an `index.ts` is auto-loaded by the v2 loader:

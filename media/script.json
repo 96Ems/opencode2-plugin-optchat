@@ -1,0 +1,36 @@
+{
+  "engine": "kokoro",
+  "model": "kokoro-v1.0.fp16",
+  "voice": "am_michael",
+  "speed": 1.0,
+  "clips": [
+    {
+      "id": "intro",
+      "text": "An agent session hits two walls. What it can remember — a window, and a compaction that throws the detail away. And what it costs — every turn pays for the history again. optchat answers both: a chat that never compacts, and a second mode that turns one conversation into a team."
+    },
+    {
+      "id": "memory",
+      "text": "Memory mode is the first answer. The log is kept word for word, a cheap model writes one line per message, and the lines pair up into a tree. The log outgrows the window; the view never does: every turn carries a fixed ninety-five thousand tokens, twelve times less, and starts clean. No context rot, and no compaction."
+    },
+    {
+      "id": "zoom",
+      "text": "When a line is too vague, the agent zooms. The line opens into the two it was made from, down to the original message. Any fact in your history is a few zooms away, and two tools are enough: zoom, and date."
+    },
+    {
+      "id": "orchestrator",
+      "text": "Orchestrator mode is the second. One conversation holds nothing but the mission and a ledger of finished runs. Every piece of noise — a diff, a log, a dead end — happens in a subagent session it starts, follows and resumes. Your chat stays short, append-only, never rewritten, so the cache keeps hitting while ten subagents work."
+    },
+    {
+      "id": "fanout",
+      "text": "Say the word and it fans out. One subagent per subject, each with its own brief and its own context, running in parallel, and their noise never reaches you. The orchestrator logs one line per run, asks status instead of blocking, collects what is done, interrupts what matters no more, and resumes the same subagent when a subject needs more. It never trusts a summary: evidence, or a second subagent to check the first."
+    },
+    {
+      "id": "tui",
+      "text": "Type slash optchat and the popup is there. Two switches: memory, and orchestrator. Then stats — what every turn carries, and what it costs, zero point one six cents a request against zero point eight six for the whole log — the view, line by line, originals bright and summaries fading with distance, the tree, and the settings."
+    },
+    {
+      "id": "outro",
+      "text": "One line to install. Memory mode for the conversation you keep, orchestrator mode for the work you fan out. The log, the tree and the ledger are plain files on your disk. optchat: the chat is the memory, and you never compact again."
+    }
+  ]
+}
