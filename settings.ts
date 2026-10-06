@@ -20,6 +20,8 @@ export const DEFAULT_DATA_DIR = join(
 export interface Settings {
   /** false: the plugin does nothing for new turns (the view stops being sent) */
   enabled: boolean;
+  /** true: expose orchestrator mode — the tool set and the workflow of the `orchestrator` agent */
+  orchestrator: boolean;
   /** "provider/model" for the summaries; "" = the model of the session itself */
   compactor: string;
   /** view budget in bytes */
@@ -34,6 +36,7 @@ export interface Settings {
 
 export const DEFAULTS: Settings = {
   enabled: true,
+  orchestrator: false,
   compactor: "",
   view: 128_000,
   cap: 30_000,
@@ -64,6 +67,7 @@ export function settingsFromEnv(): Partial<Settings> {
   if (Number.isFinite(ratio) && ratio > 0.5) env.ratio = ratio;
   if (process.env.OPTCHAT_COMPACTOR) env.compactor = process.env.OPTCHAT_COMPACTOR;
   if (process.env.OPTCHAT_DISABLED === "1") env.enabled = false;
+  if (process.env.OPTCHAT_ORCHESTRATOR === "1") env.orchestrator = true;
   return env;
 }
 
@@ -72,6 +76,7 @@ export function normalize(raw: unknown): Settings {
   if (raw && typeof raw === "object") {
     const input = raw as Partial<Settings>;
     if (typeof input.enabled === "boolean") settings.enabled = input.enabled;
+    if (typeof input.orchestrator === "boolean") settings.orchestrator = input.orchestrator;
     if (typeof input.compactor === "string") settings.compactor = input.compactor;
     if (Number.isFinite(input.view) && (input.view as number) > 2000) settings.view = Math.round(input.view as number);
     if (Number.isFinite(input.cap) && (input.cap as number) > 1000) settings.cap = Math.round(input.cap as number);

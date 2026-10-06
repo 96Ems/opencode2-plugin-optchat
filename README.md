@@ -152,6 +152,80 @@ settled        true
 </chat>
 ```
 
+## Orchestrator mode — one conversation, many subagents (optional)
+
+Memory mode above trades cache for a bounded context. Orchestrator mode takes the
+other side of that trade: the chat you keep holds a mission and a ledger, while
+everything noisy — diffs, logs, file dumps, dead ends — happens in subagent
+sessions that the orchestrator starts, follows, resumes and collects.
+
+The orchestrator's own context is **never rewritten**: it stays a normal, short,
+append-only conversation, so the prompt cache keeps matching what it already has.
+What the plugin adds is the workflow (how to brief, resume and verify subagents)
+and the tools to do it.
+
+### 1. Declare the agent
+
+The plugin cannot create an agent, so declare it once:
+
+    // ~/.config/opencode/opencode.jsonc
+    {
+      "agent": {
+        "orchestrator": {
+          "description": "Drives subagents: spawn, follow, resume, collect."
+        }
+      }
+    }
+
+The plugin supplies the rest: as this agent you get the workflow prompt and the
+tool set below, and nothing else. Every other agent is untouched.
+
+### 2. Turn the mode on
+
+`"orchestrator": true` in `settings.json` (`<data>/settings.json`), or
+`OPTCHAT_ORCHESTRATOR=1`.
+
+### 3. Use it
+
+Start a session as that agent (`opencode --agent orchestrator`, or Tab in the TUI)
+and ask in plain language:
+
+> spawn one subagent to add the retry logic and one to write its tests; when both
+> are done, tell me what changed
+
+Then the tools do the rest:
+
+| tool | what it does |
+|---|---|
+| `spawn(task, agent?, model?, title?)` | creates a session, sends the brief, returns its id at once — it runs in parallel |
+| `collect(id, say?, wait?)` | reads what it returned (bounded to `cap`); `say:` continues the *same* subagent, `wait` blocks until it is idle |
+| `status()` | the ledger of this conversation: every run, its subject, its state |
+| `stop(id)` | interrupts a running subagent |
+| `find(query, limit?)` | searches this conversation's own log, word for word |
+| `zoom(id, n)` / `date(id)` | as in memory mode |
+
+### What changes for the orchestrator
+
+- Its context is the conversation itself: never rewritten, never compacted by us,
+  and the compactor pump is skipped (there is no view to build). `zoom(id, 1)`
+  still returns any message whole and `find` searches the log.
+- The tool set is **replaced** by the seven above: as this agent you cannot edit
+  files, run commands or read the repository. Anything that needs doing is a
+  subagent's job — `read`/`search` are last resort, for verifying one precise
+  claim, never for exploring.
+- Sessions you spawned stay **plain sessions**: the harness's own history, their
+  own full tool set, no rewriting. The plugin still logs them.
+- The ledger is append-only: `<data>/orchestrator/ledger.jsonl`, one JSON event
+  per line (`spawned`, `resumed`, `done`, `failed`, `stopped`).
+
+### Why this design
+
+A subagent's context is not charged to yours — only its return is. That is what
+makes many subjects affordable inside one conversation, and because the
+orchestrator only ever appends, the prefix cache keeps hitting. The honest
+caveat: a subagent costs its own session, so the saving is context and cache, not
+"free work".
+
 ## Design notes (the parts that are easy to get wrong)
 
 1. **The view is rendered once per turn**, before the new message is logged, and

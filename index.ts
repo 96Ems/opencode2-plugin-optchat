@@ -27,8 +27,56 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import * as S from "./settings.ts";
 import * as C from "./core.ts";
+import * as O from "./orchestrator.ts";
 
 type AnyRec = Record<string, any>;
+
+// ------------------------------------------------------- orchestrator helpers
+
+/** One append-only ledger for every run this machine ever spawned. */
+function ledgerPath(root: string): string {
+  return join(root, "orchestrator", "ledger.jsonl");
+}
+
+async function loadLedger(root: string): Promise<O.RunEvent[]> {
+  try {
+    const text = await fs.readFile(ledgerPath(root), "utf8");
+    const out: O.RunEvent[] = [];
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line) as O.RunEvent;
+        if (event && typeof event.id === "string" && typeof event.event === "string") out.push(event);
+      } catch {
+        // a half-written line is not worth failing a turn for
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+async function appendLedger(root: string, event: O.RunEvent): Promise<void> {
+  await fs.mkdir(join(root, "orchestrator"), { recursive: true });
+  await fs.appendFile(ledgerPath(root), `${JSON.stringify(event)}\n`, "utf8");
+}
+
+/** The last thing a subagent said, as plain text, bounded. */
+function lastAssistantText(messages: readonly AnyRec[], cap: number): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (String(m?.role ?? "") !== "assistant") continue;
+    const parts = Array.isArray(m?.content) ? m.content : [];
+    const text = parts
+      .filter((p: AnyRec) => p?.type === "text")
+      .map((p: AnyRec) => String(p.text ?? ""))
+      .join("\n")
+      .trim();
+    if (text) return C.cutUtf8(text, cap);
+  }
+  return "";
+}
 
 /**
  * Chats owned by *this process*. OpenCode can load the same plugin more than
@@ -567,6 +615,18 @@ export default {
         const compactor = S.parseModel(settings.compactor);
         if (compactor) chat.model = compactor;
 
+        // Orchestrator sessions are deliberately left alone: their context is the
+        // conversation itself — short and append-only, so the prompt cache keeps
+        // hitting. We add the workflow once, hide every tool that is not its own,
+        // and skip the view entirely. The noise lives in the subagents.
+        const orchestrating = settings.orchestrator && O.allowed(event.agent);
+        // A session we spawned runs as a plain session: the harness's own
+        // append-only history (so its prefix cache works), none of our addendum,
+        // and its own full tool set. We still log it, like any other chat.
+        const spawned =
+          !orchestrating && (await loadLedger(dataDir)).some((e) => e.id === String(event.sessionID));
+        const plain = orchestrating || spawned;
+
         const newTurn = messages[messages.length - 1]?.role === "user";
         if (newTurn) {
           // Everything before the new message is logged first, so the view can
@@ -577,29 +637,41 @@ export default {
           // (observed: the summary never came back while the hook waited).
           // We never block: a line the compactor has not summarized yet is sent
           // as a bounded line carrying how to get it whole with zoom(id,1).
-          const lagging = C.unsettled(chat.state);
-          // The head of every payload must be byte-identical from one turn to the
-          // next, or the provider's prefix cache never hits: re-tiling the whole
-          // history each turn rewrites the first line and throws the cache away.
-          // Freeze the summarized head (append-only) and send the live tail after it.
-          C.refreshFrozen(chat.state, chat.budget);
-          chat.turnView = C.renderCached(chat.state);
-          debug(chat, `view: ${chat.state.view.length} lines, ${C.byteLen(chat.turnView)}B sent, ${lagging} waiting for the compactor`);
+          const lagging = plain ? 0 : C.unsettled(chat.state);
+          if (!plain) {
+            // The head of every payload must be byte-identical from one turn to the
+            // next, or the provider's prefix cache never hits: re-tiling the whole
+            // history each turn rewrites the first line and throws the cache away.
+            // Freeze the summarized head (append-only) and send the live tail after it.
+            C.refreshFrozen(chat.state, chat.budget);
+            chat.turnView = C.renderCached(chat.state);
+            debug(chat, `view: ${chat.state.view.length} lines, ${C.byteLen(chat.turnView)}B sent, ${lagging} waiting for the compactor`);
+          }
           await ingest(chat, messages.slice(-1));
           if (lagging) schedulePump(chat);
         } else {
           await ingest(chat, messages);
         }
 
-        const rebuilt = buildTurn(chat, messages);
-        if (rebuilt !== messages) messages.splice(0, messages.length, ...rebuilt);
+        if (!plain) {
+          const rebuilt = buildTurn(chat, messages);
+          if (rebuilt !== messages) messages.splice(0, messages.length, ...rebuilt);
+        }
 
         // Byte-identical system addendum on every call (head of the cache).
         const system: AnyRec[] = Array.isArray(event.system) ? event.system : [];
-        if (!system.some((s) => typeof s?.text === "string" && s.text.includes(SYSTEM_MARK))) {
-          system.push({ type: "text", text: ADDENDUM });
+        const mark = orchestrating ? O.MARK : SYSTEM_MARK;
+        const addendum = orchestrating ? `${O.MARK}\n${O.WORKFLOW}` : ADDENDUM;
+        if (!system.some((s) => typeof s?.text === "string" && s.text.includes(mark))) {
+          system.push({ type: "text", text: addendum });
         }
         event.system = system;
+
+        // A tool set is a permission, not a suggestion. The orchestrator gets its
+        // own tools and nothing else — the harness hands us the set right here.
+        if (orchestrating && event.tools && typeof event.tools === "object") {
+          event.tools = O.filterTools(event.tools as Record<string, unknown>);
+        }
       } catch (err) {
         if (process.env.OPTCHAT_DEBUG) console.error(`[optchat] context hook error: ${String(err)}`);
       }
@@ -659,6 +731,204 @@ export default {
             return { content: msg ? msg.date : `No message ${String(args?.id)}.` };
           } catch (err) {
             return { content: `date failed: ${String(err)}` };
+          }
+        },
+      });
+
+      // ------------------------------------------------------ orchestrator tools
+      // Registered always, gated at call time: the tool context carries the
+      // calling agent, so a model that is not the orchestrator cannot drive
+      // subagents even if it knows the names.
+
+      editor.add({
+        name: "spawn",
+        description:
+          "Start a subagent on one self-contained brief and return at once. It runs in parallel; status follows it, collect reads it. The subagent sees none of this conversation.",
+        input: {
+          type: "object",
+          properties: {
+            task: {
+              type: "string",
+              description:
+                "The complete brief: goal, exact paths, constraints, what must not break, and the shape of the report you want back.",
+            },
+            agent: { type: "string", description: "Agent to run it as. Default: the same agent as this session." },
+            model: { type: "string", description: "Optional provider/model override for this run." },
+            title: { type: "string", description: "Short title for the session list." },
+          },
+          required: ["task"],
+          additionalProperties: false,
+        },
+        execute: async (args: AnyRec, tctx: AnyRec) => {
+          if (!O.allowed(tctx?.agent)) return { content: O.refused(tctx?.agent) };
+          try {
+            const task = String(args?.task ?? "").trim();
+            if (task.length < 40) {
+              return {
+                content:
+                  "Refused: the brief is too short to be self-contained. Give the subagent the goal, the exact paths, the constraints, and the report shape you expect.",
+              };
+            }
+            const model = S.parseModel(String(args?.model ?? ""));
+            const created = (await session.create({
+              title: O.oneLine(String(args?.title ?? task), 60),
+              ...(args?.agent ? { agent: String(args.agent) } : {}),
+              ...(model ? { model } : {}),
+            })) as AnyRec;
+            const id = String(created?.id ?? "");
+            if (!id) return { content: "spawn failed: the harness returned no session id." };
+            await session.prompt({ sessionID: id, text: task });
+            await appendLedger(dataDir, {
+              id,
+              parent: String(tctx.sessionID),
+              task: O.oneLine(String(args?.title ?? task), 120),
+              event: "spawned",
+              at: Date.now(),
+            });
+            return {
+              content: `spawned ${id}\nsubject: ${O.oneLine(task, 160)}\nit runs in parallel — status to follow it, collect to read its result, collect with say: to continue it.`,
+            };
+          } catch (err) {
+            return { content: `spawn failed: ${String(err)}` };
+          }
+        },
+      });
+
+      editor.add({
+        name: "collect",
+        description:
+          "Read what a subagent returned (bounded by the tool-result cap), or continue it by passing say:. A resumed subagent keeps its own context — restate the facts it needs.",
+        input: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "The subagent session id returned by spawn." },
+            say: { type: "string", description: "Continue the same subagent with this message instead of reading a result." },
+            wait: { type: "boolean", description: "Wait for it to go idle before reading. Default false." },
+          },
+          required: ["id"],
+          additionalProperties: false,
+        },
+        execute: async (args: AnyRec, tctx: AnyRec) => {
+          if (!O.allowed(tctx?.agent)) return { content: O.refused(tctx?.agent) };
+          const id = String(args?.id ?? "").trim();
+          if (!id) return { content: "collect needs the subagent id returned by spawn." };
+          try {
+            const settings = await readSettings();
+            const events = await loadLedger(dataDir);
+            const run = O.runsOf(events).find((r) => r.id === id);
+            const task = run?.task ?? "(unknown)";
+            if (typeof args?.say === "string" && String(args.say).trim()) {
+              await session.prompt({ sessionID: id, text: String(args.say), resume: true });
+              await appendLedger(dataDir, {
+                id,
+                parent: String(tctx.sessionID),
+                task,
+                event: "resumed",
+                at: Date.now(),
+              });
+              return {
+                content: `resumed ${id} with your message. It keeps its own context, so restate anything it needs.`,
+              };
+            }
+            if (args?.wait) await session.wait({ sessionID: id });
+            const read = (await session.context({ sessionID: id })) as unknown as AnyRec[];
+            const text = lastAssistantText(Array.isArray(read) ? read : [], Math.min(settings.cap, 8_000));
+            if (!text) {
+              return {
+                content: `Nothing to collect from ${id} yet: still running, or no answer. status lists it.`,
+              };
+            }
+            await appendLedger(dataDir, {
+              id,
+              parent: String(tctx.sessionID),
+              task,
+              event: "done",
+              result: O.oneLine(text, 300),
+              at: Date.now(),
+            });
+            return { content: text };
+          } catch (err) {
+            return { content: `collect failed: ${String(err)}` };
+          }
+        },
+      });
+
+      editor.add({
+        name: "status",
+        description: "The ledger: every subagent this conversation started, with its subject and its state.",
+        input: { type: "object", properties: {}, additionalProperties: false },
+        execute: async (_args: AnyRec, tctx: AnyRec) => {
+          if (!O.allowed(tctx?.agent)) return { content: O.refused(tctx?.agent) };
+          try {
+            const runs = O.runsOfParent(await loadLedger(dataDir), String(tctx.sessionID));
+            if (!runs.length) return { content: "No subagent yet. spawn one with a self-contained brief." };
+            const lines = runs.map(
+              (r) =>
+                `${r.state.padEnd(7)} ${r.id}  ${O.oneLine(r.task, 80)}${r.result ? `  -> ${O.oneLine(r.result, 120)}` : ""}`,
+            );
+            const running = runs.filter((r) => r.state === "running").length;
+            return { content: `runs of this conversation (${running} running / ${runs.length}):\n${lines.join("\n")}` };
+          } catch (err) {
+            return { content: `status failed: ${String(err)}` };
+          }
+        },
+      });
+
+      editor.add({
+        name: "stop",
+        description: "Interrupt a running subagent.",
+        input: {
+          type: "object",
+          properties: { id: { type: "string", description: "The subagent session id." } },
+          required: ["id"],
+          additionalProperties: false,
+        },
+        execute: async (args: AnyRec, tctx: AnyRec) => {
+          if (!O.allowed(tctx?.agent)) return { content: O.refused(tctx?.agent) };
+          const id = String(args?.id ?? "").trim();
+          if (!id) return { content: "stop needs the subagent id." };
+          try {
+            await session.interrupt({ sessionID: id });
+            const run = O.runsOf(await loadLedger(dataDir)).find((r) => r.id === id);
+            await appendLedger(dataDir, {
+              id,
+              parent: String(tctx.sessionID),
+              task: run?.task ?? "(unknown)",
+              event: "stopped",
+              at: Date.now(),
+            });
+            return { content: `interrupted ${id}` };
+          } catch (err) {
+            return { content: `stop failed: ${String(err)}` };
+          }
+        },
+      });
+
+      editor.add({
+        name: "find",
+        description:
+          "Search this conversation's own log, word for word, before asking a subagent for something you already have. Returns lines; zoom(id, 1) opens one whole.",
+        input: {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Text to look for, case-insensitive." },
+            limit: { type: "number", description: "Maximum lines to return (default 12)." },
+          },
+          required: ["query"],
+          additionalProperties: false,
+        },
+        execute: async (args: AnyRec, tctx: AnyRec) => {
+          if (!O.allowed(tctx?.agent)) return { content: O.refused(tctx?.agent) };
+          try {
+            const chat = await getChat(String(tctx.sessionID));
+            const rows = chat.state.messages.map((m) => ({ i: m.i, text: `${m.kind}: ${m.text}` }));
+            const hits = O.findLines(rows, String(args?.query ?? ""), Number(args?.limit) || 12);
+            if (!hits.length) {
+              return { content: `Nothing matching ${JSON.stringify(String(args?.query ?? ""))} in this conversation's log.` };
+            }
+            return { content: `${hits.length} line(s):\n${hits.join("\n")}\n\nzoom(id, 1) opens the message whole.` };
+          } catch (err) {
+            return { content: `find failed: ${String(err)}` };
           }
         },
       });
