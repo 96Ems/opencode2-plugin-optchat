@@ -51,7 +51,8 @@ git clone https://github.com/96Ems/opencode2-plugin-optchat.git ~/.config/openco
 ```
 
 No config edit, no npm dependency: the plugin imports nothing but Node builtins
-plus its own `./core.ts`. (Measured on opencode **2.0.22 and 2.0.23**: the
+plus its own modules (`core.ts`, `settings.ts`, `orchestrator.ts`). (Measured on
+opencode **2.0.22 and 2.0.23**: the
 `plugin: [...]` array of `opencode.json(c)` does not load a local file in these
 builds, while `<plugins-dir>/<name>/index.ts` does.)
 
@@ -63,7 +64,7 @@ environment variables otherwise — handy since a directory install has no
 
 | option | env | default | meaning |
 |---|---|---|---|
-| `view` | `OPTCHAT_VIEW` | `128000` | view budget in bytes (≈ 62–64k tokens) |
+| `view` | `OPTCHAT_VIEW` | `128000` | view budget in bytes (the recipe's 128 KB: ~500 summary lines) |
 | `compactor` | `OPTCHAT_COMPACTOR` | the session's own model | `"provider/model"` for the summaries — pick a cheap (but competent) one |
 | `dataDir` | `OPTCHAT_DATA_DIR` | `$XDG_DATA_HOME/opencode/optchat` | where chats are stored |
 | `enabled` | `OPTCHAT_DISABLED=1` | `true` | set `false` to disable |
@@ -72,14 +73,15 @@ environment variables otherwise — handy since a directory install has no
 
 ```
 <dataDir>/<sessionID>/
-  main/YYYY-MM-DD.jsonl   {i,kind,text,size,date,src}   every message, verbatim
+  main/YYYY-MM-DD.jsonl   {i,kind,text,size,date,src,inst}   every message, verbatim
   tree/YYYY-MM-DD.jsonl   {l,i,text,size}               one summary line per node
   optchat.log                                           what the plugin did
   lock                                                  one writer per chat
 ```
 
 `kind` is `user` (the user's words), `talk` (replies), `tool` (tool calls),
-`echo` (tool results), `note` (imported memories). Every line is written with
+`echo` (tool results), and `note`, reserved for memories imported by an older
+system — nothing in this plugin writes it yet. Every line is written with
 one `write` then `fsync`. A torn line (crash mid-write) is reported and skipped
 at load; the log is history and is never edited.
 
@@ -97,9 +99,9 @@ close):
   - transcript vs context sent, compression factor, budget bar;
   - context carried by every request, without optchat vs with it, at 0/25/50/75/100 %
     of the session plus last turn and session totals, each with its own bar;
-  - **cost in USD** the same way round: last turn and whole session, with the
-    **saving**, the prices used (input / cache read / output per million tokens)
-    and their source (the model catalogue, i.e. `ModelInfo.cost`);
+  - **cost** the same way round: last turn and whole session, with the
+    **saving**, the prices used (input / cache read / output, per million tokens,
+    shown in cents) and their source (the model catalogue, i.e. `ModelInfo.cost`);
   - the provider's own numbers (`tokens.in`, `tokens.cache.read`, `tokens.out`,
     and `session.cost`) for the "with optchat" side and for what was really paid;
   - a warning when the counterfactual would not have fitted the model window.
@@ -108,8 +110,9 @@ close):
   (L1 light → L5 dark), and a cut part shows the `zoom(start, count)` that
   recovers it. This replaces reading the raw context string.
 - **Summaries** — the tree: how many nodes per level and what each node covers.
-- **Settings** — memory on/off, compactor model (picked from the catalogue),
-  context budget, tool result cap, bytes per token, and where the file lives.
+- **Settings** — memory on/off, orchestrator mode, compactor model (picked from
+  the catalogue), context budget, tool result cap, the bytes-per-token `ratio`,
+  and where the file lives.
 - **Raw context string** — the exact text sent to the model, if you want it.
 
 The sidebar shows `optchat · 918 msgs · view 127 KB · ×11.4` (plus
@@ -222,15 +225,23 @@ Then the tools do the rest:
 | `collect(id, say?, wait?)` | reads what it returned (bounded to `cap`); `say:` continues the *same* subagent, `wait` blocks until it is idle |
 | `status()` | the ledger of this conversation: every run, its subject, its state |
 | `stop(id)` | interrupts a running subagent |
+| `note(id, task, event?, result?)` | records one ledger line for a run you started with the harness's own subagent tool |
 | `find(query, limit?)` | searches this conversation's own log, word for word |
 | `zoom(id, n)` / `date(id)` | as in memory mode |
+
+Prefer the harness's own subagent tool. OpenCode v2 ships `task` (it takes the
+agent to run), which starts a run natively and resolves the model from the agent's
+own configuration; the injected workflow tells the orchestrator to use it when it
+exists and to record each run with `note`. `spawn` is the fallback: it creates a
+session and prompts it, and on some harness builds such a session sits in the
+inbox instead of running.
 
 ### What changes for the orchestrator
 
 - Its context is the conversation itself: never rewritten, never compacted by us,
   and the compactor pump is skipped (there is no view to build). `zoom(id, 1)`
   still returns any message whole and `find` searches the log.
-- The tool set is **replaced** by the seven above: as this agent you cannot edit
+- The tool set is **replaced** by the eight above: as this agent you cannot edit
   files, run commands or read the repository. Anything that needs doing is a
   subagent's job — `read`/`search` are last resort, for verifying one precise
   claim, never for exploring.
@@ -316,21 +327,24 @@ MIT — see [LICENSE](LICENSE). The design follows VictorTaelin's OptChat spec
     not collect (`collect` answered "still running" three times in a row while
     that was true). The ledger records `spawned` / `resumed` / `stopped` with
     their parent, `status` / `collect` / `stop` answer, and the gating holds.
-  - **Not working yet.** A session created by `spawn` is created and prompted but
-    never runs: it stays `running`, and the provider log shows the model it fell
-    back to is unavailable in this region. Passing `agent` and `model` to
-    `session.create` did not change that here. Note that v2 also ships its own
-    background `subagent` mechanism, and that one worked in the same session.
-    Aligning `spawn` with it — or finding the inbox/delivery flag that actually
-    dispatches a created session — is the next step. The plugin's value
-    (workflow, ledger, gating, and an orchestrator whose own context stays short
-    and cacheable) does not depend on which of the two starts the runs.
+  - **`spawn` is the fallback, and it does not always dispatch.** A session it
+    creates and prompts has been seen to stay `running` with no output, and the
+    provider log showed the model it fell back to was unavailable in this region;
+    passing `agent` and `model` to `session.create` did not change that. OpenCode
+    v2 ships its own background subagent mechanism (the `task` tool), which worked
+    in the same session — so the workflow tells the orchestrator to prefer `task`
+    and to record each run itself with `note`. The plugin's value (workflow,
+    ledger, gating, and an orchestrator whose own context stays short and
+    cacheable) does not depend on which of the two starts the runs.
 
 - Sessions are per-chat: each OpenCode session gets its own memory (a subagent
   session gets its own too, which matches OptChat's rule that only the master's
   chat is the memory).
-- The view budget is a byte count, not tokens: pick `view` so that
-  `view / 3` stays well under the model's context window.
+- The view budget is a byte count, not tokens: it is what the plugin measures and
+  enforces. The UI converts bytes to tokens with the `ratio` setting (1.3 by
+  default); the recipe's own measurement of this dense summary text is ≈ 2 bytes
+  per token, so read the token columns as estimates — set `ratio` to 2 for the
+  recipe's figure. Keep `view` well under the model's context window either way.
 - The compactor runs in the server process, so a one-shot `opencode run` exits
   before it finishes; it catches up as soon as a server stays alive (TUI or the
   background service). With a long-lived server, summaries are always ready
