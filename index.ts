@@ -571,8 +571,7 @@ export default {
       if (!chat.turnView) {
         // Same bytes as the hook builds for a fresh turn, so a tool-loop call
         // inside one turn re-sends an identical context (cache-friendly).
-        C.refreshFrozen(chat.state, chat.budget);
-        chat.turnView = C.renderCached(chat.state);
+        chat.turnView = C.renderView(chat.state, "line");
       }
       const view = chat.turnView;
       const head: AnyRec = {
@@ -648,12 +647,11 @@ export default {
           // as a bounded line carrying how to get it whole with zoom(id,1).
           const lagging = plain ? 0 : C.unsettled(chat.state);
           if (!plain) {
-            // The head of every payload must be byte-identical from one turn to the
-            // next, or the provider's prefix cache never hits: re-tiling the whole
-            // history each turn rewrites the first line and throws the cache away.
-            // Freeze the summarized head (append-only) and send the live tail after it.
-            C.refreshFrozen(chat.state, chat.budget);
-            chat.turnView = C.renderCached(chat.state);
+            // The view IS the context, in its own order: rendered once per turn,
+            // before the new message is logged, then reused for every step of the
+            // turn — so a tool-loop call re-sends identical bytes from the start
+            // of the payload, and the fold only appends and coarsens at the end.
+            chat.turnView = C.renderView(chat.state, "line");
             debug(chat, `view: ${chat.state.view.length} lines, ${C.byteLen(chat.turnView)}B sent, ${lagging} waiting for the compactor`);
           }
           await ingest(chat, messages.slice(-1));
@@ -693,7 +691,7 @@ export default {
         const chat = await getChat(String(event.sessionID));
         if (!chat.owned || !isOwner(chat.dir, INSTANCE)) return;
         await ingest(chat, Array.isArray(event.messages) ? event.messages : []);
-        event.result = { summary: C.renderCached(chat.state) };
+        event.result = { summary: C.renderView(chat.state, "line") };
       } catch (err) {
         if (process.env.OPTCHAT_DEBUG) console.error(`[optchat] compaction hook error: ${String(err)}`);
       }

@@ -249,19 +249,24 @@ caveat: a subagent costs its own session, so the saving is context and cache, no
 
 ## Design notes (the parts that are easy to get wrong)
 
-1. **The view is rendered once per turn**, before the new message is logged, and
-   reused for every step of that turn: it is the head of the cached prefix.
-   Recomputing it per step would kill the cache.
+1. **The view is what a turn sends** — rendered once per turn, before the new
+   message is logged, and reused for every step of that turn, so a tool-loop call
+   re-sends identical bytes from the very start of the payload. Recomputing it per
+   step would kill the cache, and replacing it with a coarser "frozen head" of
+   tree nodes does not help either: it re-renders the whole log at that level
+   (16, 32, 64 messages per line), so the payload shrinks to a fraction of the
+   budget and the recent detail the tiling exists to keep is gone.
 2. **Never split.** The view only appends at the end and coarsens; a pair is
    merged only when its parent node exists, choosing the most due pair
    (oldest relative to its size). The start of the view is therefore identical
    from one turn to the next.
 3. **Only summaries in the view**, never a whole message — a 30 KB tool result
    entering the view would permanently erase old detail.
-4. **Never show cut text.** An unsummarized line renders as
-   `(not summarized yet: zoom it)` when browsed, and **whole** (never truncated)
-   when a turn needs it — the fail-safe — and only until the compactor catches
-   up during that same turn.
+4. **Never show cut text silently.** An unsummarized line renders as
+   `(not summarized yet: zoom it)` when browsed; when a turn needs it, it goes out
+   as one bounded line (head and tail, at most `NODE` bytes) carrying the
+   `zoom(id, 1)` that recovers the message whole — the fail-safe — and only until
+   the compactor catches up during that same turn.
    *Deviation from the spec:* OptChat's turn loop waits (`settle`) until every
    view line is a summary. Here it must not: `ctx.generate.text` is queued behind
    the session request that triggered the hook, so a call issued from a `context`
@@ -269,7 +274,7 @@ caveat: a subagent costs its own session, so the saving is context and cache, no
    wait with the summary call never returning; the same call resolved seconds
    after the hook returned). The turn is therefore never blocked, and the
    compactor catches up during and after the turn — at most the previous turn's
-   last reply can appear whole once.
+   last reply can appear as a bounded line once.
 5. **Messages are compressed one at a time, in order** (`end <= first`), while
    merges of finished parts run alongside, up to 8 at once. The compactor never
    reads a line that is not a summary.
@@ -289,7 +294,7 @@ caveat: a subagent costs its own session, so the saving is context and cache, no
 bun test
 ```
 
-37 tests, all pure (no network, no model): `test/core.test.ts` covers byte
+71 tests, all pure (no network, no model): `test/core.test.ts` covers byte
 handling, free nodes, in-order compaction, the fold (budget, tiling,
 monotonicity), zoom, prompt assembly, message decomposition and capping;
 `test/settings.test.ts` covers the settings file, the shared dirs, the cost
