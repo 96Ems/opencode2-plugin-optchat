@@ -6,7 +6,8 @@
  *   ├ Stats            session, context carried per turn, cost with/without optchat
  *   ├ View             exactly what the model receives, one line per part
  *   ├ Summaries        the summary tree, level by level
- *   └ Settings         on/off, compactor model, context budget, tool result cap
+ *   └ Settings         on/off, compactor model, context budget, tool result cap,
+ *                      and the plugin version with the copy it was loaded from
  *
  * It reads the same chat directory as the server plugin (they never call each
  * other): settings live in settings.json, which the server re-reads every turn.
@@ -19,6 +20,7 @@ import { join } from "node:path";
 import * as S from "./settings.ts";
 import * as St from "./stats.ts";
 import * as C from "./core.ts";
+import * as V from "./version.ts";
 
 type AnyRec = Record<string, any>;
 
@@ -393,10 +395,34 @@ export default Plugin.define({
             description: "used for every size and token estimate shown here",
           },
           { title: "Where do these live?", value: "path", description: path },
+          {
+            title: `Plugin version — v${V.VERSION}`,
+            value: "version",
+            description: V.versionLine(),
+          },
         ],
       });
       if (choice === undefined) return;
 
+      if (choice === "version") {
+        const dir = V.pluginDir();
+        const at = V.deployedAt();
+        await ctx.ui.dialog.alert({
+          title: `optchat — v${V.VERSION}`,
+          message: [
+            `Plugin version: v${V.VERSION}`,
+            `Loaded from: ${dir || "unknown (the runtime did not name the module path)"}`,
+            at ? `Deployed: ${at}` : "",
+            "",
+            "Checked against package.json by test/version.test.ts, so the two files",
+            "cannot drift. Bump with `bun bin/bump.ts patch|minor|major` in the same",
+            "commit as the change it ships, then copy the files into the plugin folder.",
+          ]
+            .filter((line) => line !== "")
+            .join("\n"),
+        });
+        return showSettings();
+      }
       if (choice === "path") {
         await ctx.ui.dialog.alert({
           title: "optchat — settings.json",

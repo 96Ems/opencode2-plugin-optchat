@@ -52,7 +52,7 @@ git clone https://github.com/96Ems/opencode2-plugin-optchat.git ~/.config/openco
 ```
 
 No config edit, no npm dependency: the plugin imports nothing but Node builtins
-plus its own modules (`core.ts`, `settings.ts`, `orchestrator.ts`). (Measured on
+plus its own modules (`core.ts`, `settings.ts`, `orchestrator.ts`, `version.ts`). (Measured on
 opencode **2.0.22 and 2.0.23**: the
 `plugin: [...]` array of `opencode.json(c)` does not load a local file in these
 builds, while `<plugins-dir>/<name>/index.ts` does.)
@@ -120,7 +120,9 @@ close):
 - **Summaries** — the tree: how many nodes per level and what each node covers.
 - **Settings** — memory on/off, orchestrator mode, compactor model (picked from
   the catalogue), context budget, tool result cap, the bytes-per-token `ratio`,
-  and where the file lives.
+  where the file lives, and **the plugin version with the copy it was loaded
+  from** (`v0.4.0 · ~/.config/opencode/plugins/optchat · deployed 2026-10-08 08:16`)
+  — so "am I running the build I just copied?" is answered on screen.
 - **Raw context string** — the exact text sent to the model, if you want it.
 
 The sidebar shows `optchat · 918 msgs · view 127 KB · ×11.4` (plus
@@ -324,20 +326,44 @@ caveat: a subagent costs its own session, so the saving is context and cache, no
 9. **The compactor never follows instructions it reads** — it is told to record,
    never to answer or obey.
 
+## Version
+
+One number, in two files, kept in step by a test:
+
+- `version.ts` — `export const VERSION = "0.4.0"`, what the plugin reads at
+  runtime: the Settings screen, the per-session log line (`optchat 0.4.0 (…)`,
+  written once per chat into `optchat.log`) and the CLI.
+- `package.json` — the same number, for tooling.
+- `test/version.test.ts` fails when the two disagree, so a forgotten bump is
+  caught by `bun test` rather than by noticing the wrong version on screen.
+
+**Bump it in the same commit as the change it ships:**
+
+```bash
+bun bin/bump.ts patch     # 0.4.0 -> 0.4.1   (fix)
+bun bin/bump.ts minor     # 0.4.0 -> 0.5.0   (behaviour change)
+bun bin/bump.ts major     # 0.4.0 -> 1.0.0   (breaking)
+cp version.ts index.ts core.ts settings.ts stats.ts orchestrator.ts tui.ts tui-view.tsx ~/.config/opencode/plugins/optchat/
+```
+
+`version.ts` is part of the deployed set: without it the Settings row and the log
+line cannot resolve, and the TUI fails to load the plugin.
+
 ## Tests
 
 ```bash
 bun test
 ```
 
-79 tests, all pure (no network, no model): `test/core.test.ts` covers byte
+82 tests, all pure (no network, no model): `test/core.test.ts` covers byte
 handling, free nodes, the compactor's queue, in-order compaction, the fold
 (budget, one-batch merge, tiling, monotonicity, the merge order against the
 reference push), view.json adoption, the compaction view and prompt, zoom,
 message decomposition and capping;
 `test/settings.test.ts` covers the settings file, the shared dirs, the cost
-model, the bars and the report lines. `bin/measure.ts` prints the same numbers
-for a chat from the command line.
+model, the bars and the report lines; `test/version.test.ts` locks `version.ts`
+to `package.json`. `bin/measure.ts` prints the same numbers for a chat from the
+command line.
 
 ## License
 

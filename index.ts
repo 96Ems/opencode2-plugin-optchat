@@ -28,6 +28,7 @@ import { randomUUID } from "node:crypto";
 import * as S from "./settings.ts";
 import * as C from "./core.ts";
 import * as O from "./orchestrator.ts";
+import * as V from "./version.ts";
 
 type AnyRec = Record<string, any>;
 
@@ -357,6 +358,9 @@ export default {
           notified: new Set(),
           rows: [],
         };
+        // Written on every chat open (once per session): the version and the copy
+        // that produced these lines, so the log answers "which revision ran?".
+        await logLine(chat, `optchat ${V.VERSION} (${V.pluginDir() || "unknown dir"})`);
         if (!lockHeld) await logLine(chat, `WARNING another process holds the lock on ${dir}`);
         if (!owned) await logLine(chat, `another optchat instance in this process owns ${dir}: standing down`);
         else if (tookOver) await logLine(chat, "took over a stale lease (the plugin was reloaded?)");

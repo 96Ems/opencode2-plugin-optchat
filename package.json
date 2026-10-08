@@ -1,10 +1,16 @@
 {
   "name": "opencode2-plugin-optchat",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Endless chat memory for OpenCode v2: the chat history is the memory (log + summary tree + tiling view).",
-  "keywords": ["opencode", "opencode-plugin", "memory", "context", "compaction"],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "memory",
+    "context",
+    "compaction"
+  ],
   "license": "MIT",
   "scripts": {
     "test": "bun test",
