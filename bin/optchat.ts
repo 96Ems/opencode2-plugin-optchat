@@ -60,18 +60,27 @@ for (const line of await read("tree")) {
   const row = JSON.parse(line);
   state.nodes.set(C.nodeKey(row.l, row.i), row.text);
 }
-for (const m of state.messages) {
-  const part: C.Part = { l: 0, i: m.i };
-  state.view.push(part);
-  state.viewBytes += C.partBytes(state, part);
-  C.fit(state);
+let adopted = false;
+try {
+  adopted = C.adoptView(state, JSON.parse(await fs.readFile(join(dir, "view.json"), "utf8")));
+} catch {
+  /* no saved view: fold it */
 }
+if (!adopted) {
+  for (const m of state.messages) {
+    const part: C.Part = { l: 0, i: m.i };
+    state.view.push(part);
+    state.viewBytes += C.partBytes(state, part);
+    C.fit(state);
+  }
+}
+C.primeQueue(state);
 
 console.log(`session        ${target.includes("/") ? dir : target}`);
 console.log(`dir            ${dir}`);
 console.log(`messages       ${state.messages.length}  (${state.messages.reduce((a, m) => a + m.size, 0)} bytes)`);
 console.log(`tree nodes     ${state.nodes.size}`);
-console.log(`view           ${state.view.length} lines, ${state.viewBytes} bytes (budget ${C.VIEW})`);
+console.log(`view           ${state.view.length} lines, ${state.viewBytes} bytes (budget ${C.VIEW})${adopted ? "  · from view.json" : ""}`);
 console.log(`settled        ${C.settled(state)}${C.settled(state) ? "" : `  (${C.unsettled(state)} line(s) waiting for the compactor, first at ${C.first(state)})`}`);
 console.log(`lines as sent  ${C.byteLen(C.renderView(state, "line"))} bytes  (--raw to see them)  ·  transcript ${state.messages.reduce((a, m) => a + m.size, 0)} bytes`);
 console.log("");

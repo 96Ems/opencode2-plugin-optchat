@@ -3,10 +3,10 @@
  * summary tree + tiling view). No I/O, no model calls: everything here is
  * deterministic and unit-testable.
  *
- * Spec: "OptChat: an endless chat where the AI remembers everything"
- * (VictorTaelin). Node (l,i) covers messages [i*2^l, (i+1)*2^l); a node's text
- * is at most NODE bytes; the view tiles [0,T) with tree nodes and holds at most
- * VIEW bytes.
+ * Spec: "UniiChat: one chat that never ends" (VictorTaelin — the OptChat
+ * recipe). Node (l,i) covers messages [i*2^l, (i+1)*2^l) and holds at most NODE
+ * bytes of text. The view tiles [0,T) with tree nodes, and when it passes VIEW
+ * bytes it merges down to VIEW/2 in ONE batch (never a little at each message).
  */
 
 import { createHash } from "node:crypto";
@@ -14,6 +14,11 @@ import { createHash } from "node:crypto";
 export const NODE = 512;
 export const VIEW = 128_000;
 export const CAP = 30_000;
+/** A node may start while fewer than this many view lines ahead of it are unbuilt. */
+export const PENDING = 8;
+/** A compaction sees the chat's view merged further into this band, in bytes. */
+export const COMPACT_HIGH = 32_000;
+export const COMPACT_LOW = 16_000;
 
 export type Kind = "user" | "talk" | "tool" | "echo" | "note";
 
@@ -30,6 +35,11 @@ export interface Part {
   i: number;
 }
 
+export interface Candidate {
+  l: number;
+  i: number;
+}
+
 export interface ChatState {
   /** every message, verbatim, append-only */
   messages: LogMsg[];
@@ -40,16 +50,53 @@ export interface ChatState {
   /** the view: adjacent parts tiling messages [0, T), oldest first */
   view: Part[];
   viewBytes: number;
+  /** nodes that may still need building, in the order they became possible */
+  queue: Candidate[];
+  queued: Set<string>;
+  /** the view changed since the host last wrote it out (view.json) */
+  viewDirty: boolean;
+  /** the view passed its high mark and is being merged down to the low one */
+  batching: boolean;
 }
 
 export function newChatState(): ChatState {
-  return { messages: [], nodes: new Map(), free: new Map(), view: [], viewBytes: 0 };
+  return {
+    messages: [],
+    nodes: new Map(),
+    free: new Map(),
+    view: [],
+    viewBytes: 0,
+    queue: [],
+    queued: new Set(),
+    viewDirty: false,
+    batching: false,
+  };
 }
 
 // ---------------------------------------------------------------- byte utils
 
 export function byteLen(s: string): number {
   return Buffer.byteLength(s, "utf8");
+}
+
+/** Characters, counted as code points — the unit the tool-result cap is in. */
+export function charLen(s: string): number {
+  let n = 0;
+  for (const _ of s) n++;
+  return n;
+}
+
+/** Longest prefix of `s` in at most `max` characters, never splitting one. */
+export function cutChars(s: string, max: number): string {
+  if (max <= 0) return "";
+  let out = "";
+  let n = 0;
+  for (const ch of s) {
+    if (n >= max) break;
+    out += ch;
+    n++;
+  }
+  return out;
 }
 
 const REPLACEMENT = "\uFFFD";
@@ -62,24 +109,13 @@ export function cutUtf8(s: string, max: number): string {
   return out;
 }
 
-function padBytes(s: string, bytes: number): string {
-  let out = s;
-  while (byteLen(out) < bytes) out += " ";
-  return cutUtf8(out, bytes);
-}
-
 /**
- * A realistic, dense summary line used as the size reference shown to the
- * compactor ("models can't count bytes"). Exactly NODE bytes.
+ * The size reference shown to the compactor: a ruler of exactly NODE dashes.
+ *
+ * Never a real sample line: the model copies the sample's content into its own
+ * answer ("a real sample line as the ruler got its content copied").
  */
-const SCALE_BASE =
-  "user: keep the vite dev server on 5173 and never touch the prod compose file; " +
-  "talk: moved token refresh into src/auth/refresh.ts, tests green; " +
-  "tool: edit src/auth/refresh.ts; echo: ok, 412 bytes written; " +
-  "user: correction, the fetch timeout is 5s, it lives in config/limits.ts; " +
-  "work: api review done, 3 findings: no rate limit, no timeout, no retry on 429; " +
-  "talk: added the retry with backoff in src/api/client.ts and documented it";
-export const SCALE: string = padBytes(SCALE_BASE, NODE);
+export const RULER: string = "-".repeat(NODE);
 
 // ---------------------------------------------------------------- the tree
 
@@ -139,7 +175,7 @@ export function built(state: ChatState, l: number, i: number): boolean {
 
 /** Both sources of the node exist. */
 export function ready(state: ChatState, l: number, i: number): boolean {
-  if (l === 0) return i < state.messages.length;
+  if (l === 0) return i >= 0 && i < state.messages.length;
   return nodeText(state, l - 1, 2 * i) !== undefined && nodeText(state, l - 1, 2 * i + 1) !== undefined;
 }
 
@@ -155,37 +191,115 @@ export function settled(state: ChatState): boolean {
   return first(state) >= state.messages.length;
 }
 
-export interface Candidate {
-  l: number;
-  i: number;
+/**
+ * How many view lines before message `end` the compactor has not summarized yet.
+ *
+ * The count is capped at `stop`: past that the answer is only "not yet", and
+ * stopping early is what keeps this cheap — a fresh chat has hundreds of unbuilt
+ * lines queued, and walking all of them per node would be the O(N^2) scan this
+ * queue exists to avoid. A node may start only while fewer than PENDING lines
+ * ahead of it are unbuilt.
+ */
+export function unbuiltBefore(state: ChatState, end: number, stop = PENDING, frontier = firstUnbuilt(state)): number {
+  let n = 0;
+  for (let k = frontier; k < state.view.length; k++) {
+    const part = state.view[k]!;
+    if (part.i * span(part.l) >= end) break;
+    if (nodeText(state, part.l, part.i) !== undefined) continue;
+    if (++n >= stop) return n;
+  }
+  return n;
+}
+
+/** Index in the view of the first line the compactor has not summarized. */
+export function firstUnbuilt(state: ChatState): number {
+  for (let k = 0; k < state.view.length; k++) {
+    const part = state.view[k]!;
+    if (nodeText(state, part.l, part.i) === undefined) return k;
+  }
+  return state.view.length;
 }
 
 /**
- * Nodes the compactor may start now, in order, up to `limit`.
+ * Put a node in the ready queue — or, if it is already a node (stored, or free
+ * because its source fits), its parent, since building this one is what can make
+ * the parent buildable.
  *
- * A node is started when it is unbuilt, not busy, has its sources, and its
- * whole context is already summarized (`end <= first`). That last rule makes
- * messages compress one at a time, in order, while merges of finished parts run
- * alongside — the compactor never reads a line that is not a summary.
+ * Never scan the tree for work: over a long chat that is O(N^2). The queue is
+ * filled as messages arrive (pushMessage) and as builds finish (the host calls
+ * this); primeQueue fills it once, when a chat is loaded.
  */
-export function candidates(state: ChatState, busy: Set<string>, limit: number, failed?: Map<string, number>, now = Date.now(), retryMs = 10_000): Candidate[] {
-  const out: Candidate[] = [];
-  if (limit <= 0) return out;
+export function enqueue(state: ChatState, l: number, i: number): void {
+  for (;;) {
+    if (l < 0 || i < 0) return;
+    if (i * span(l) >= state.messages.length) return; // covers no message yet
+    if (!ready(state, l, i)) return; // wait until its sources exist
+    const key = nodeKey(l, i);
+    if (state.nodes.has(key) || state.free.has(key)) {
+      const pl = l + 1;
+      const pi = i >> 1;
+      if (pi * span(pl) < state.messages.length && ready(state, pl, pi)) {
+        l = pl;
+        i = pi;
+        continue;
+      }
+      return;
+    }
+    if (!state.queued.has(key)) {
+      state.queued.add(key);
+      state.queue.push({ l, i });
+    }
+    return;
+  }
+}
+
+/** Fill the queue from the tree (once, when a chat is loaded). */
+export function primeQueue(state: ChatState): void {
+  state.queue = [];
+  state.queued = new Set();
   const T = state.messages.length;
-  const f = first(state);
   for (let l = 0; span(l) <= T; l++) {
     for (let i = 0; (i + 1) * span(l) <= T; i++) {
-      if (out.length >= limit) return out;
-      const key = nodeKey(l, i);
-      if (state.nodes.has(key) || state.free.has(key) || busy.has(key)) continue;
-      const ts = failed?.get(key);
-      if (ts !== undefined && now - ts < retryMs) continue;
-      const end = l === 0 ? i : (i + 1) * span(l);
-      if (end > f) continue;
-      if (!ready(state, l, i)) continue;
-      out.push({ l, i });
+      if (ready(state, l, i)) enqueue(state, l, i);
     }
   }
+}
+
+/**
+ * Nodes the compactor may start now, in order, up to `limit`, taken from the
+ * ready queue. A node starts when it is unbuilt, not busy, has its sources, is
+ * within PENDING unbuilt lines of the compactor's own frontier, and is not
+ * backing off after a failure.
+ */
+export function candidates(
+  state: ChatState,
+  busy: Set<string>,
+  limit: number,
+  failed?: Map<string, number>,
+  now = Date.now(),
+  retryMs = 10_000,
+): Candidate[] {
+  const out: Candidate[] = [];
+  if (limit <= 0) return out;
+  const wait: Candidate[] = [];
+  const frontier = firstUnbuilt(state);
+  for (const cand of state.queue) {
+    const key = nodeKey(cand.l, cand.i);
+    if (state.nodes.has(key) || state.free.has(key)) {
+      state.queued.delete(key);
+      continue;
+    }
+    // Stays in the queue until it is built: `busy` is what stops a second start,
+    // and a node that fails or never runs is never lost.
+    wait.push(cand);
+    if (out.length >= limit || busy.has(key) || !ready(state, cand.l, cand.i)) continue;
+    const ts = failed?.get(key);
+    if (ts !== undefined && now - ts < retryMs) continue;
+    const end = cand.l === 0 ? cand.i : (cand.i + 1) * span(cand.l);
+    if (unbuiltBefore(state, end, PENDING, frontier) >= PENDING) continue;
+    out.push(cand);
+  }
+  state.queue = wait;
   return out;
 }
 
@@ -265,9 +379,8 @@ export function unsettled(state: ChatState): number {
  * 1200-message chat, a 36 KB payload of 16-messages-per-line lines instead of the
  * 128 KB view, with the last 100 messages at level 4 instead of level 0 — so the
  * recent detail the tiling exists to keep is gone, and every figure measured from
- * this view describes a payload that is never sent. The fold above is what keeps
- * the cache: it only appends and coarsens near the end, so consecutive payloads
- * share their whole prefix up to the last few lines (measured ~70 % of the bytes).
+ * this view describes a payload that is never sent. The fold is what keeps the
+ * cache: it only appends and coarsens near the end, in batches.
  */
 export function renderView(state: ChatState, mode: "placeholder" | "line" = "placeholder"): string {
   const lines = state.view.map((part) => {
@@ -296,7 +409,7 @@ export function zoomText(state: ChatState, id: number, n: number): string {
     .map((part) => {
       const text = nodeText(state, part.l, part.i);
       const size = span(part.l);
-      return `${part.i * size}+${size}|${text === undefined ? "(not summarized yet: zoom it)" : oneLine(text)}`;
+      return `${part.i * size}+${size}|${text === undefined ? PLACEHOLDER : oneLine(text)}`;
     })
     .join("\n");
 }
@@ -304,30 +417,60 @@ export function zoomText(state: ChatState, id: number, n: number): string {
 // ---------------------------------------------------------------- the view
 
 /**
- * Fold the view after a new message: append its own line, then merge the most
- * due pair while over budget. Never split: the view only appends and coarsens.
+ * Age of a sibling pair, as the spec measures it: how long ago the pair ENDED,
+ * measured in its own line size.
+ *
+ *   due = (T - last) / 2^l        last = the pair's last message
+ *
+ * Measuring from the pair's FIRST message ((T - first)/2^l) is wrong: near ties
+ * it merges old pairs and rewrites old lines that the reference's rollback-style
+ * push keeps. Checked against that push over 4,000 steps, this rule reproduces it
+ * at every step and the `first` rule on 275 of 4,000. Merging early lines that
+ * were kept is what erodes the cached prefix: the prefix ends at the first byte
+ * that changed, so a rewrite near the head costs the whole view after it.
  */
-export function fit(state: ChatState, budget = VIEW): void {
+export function pairDue(a: Part, T: number): number {
+  const last = (a.i + 2) * span(a.l) - 1;
+  return (T - last) / span(a.l);
+}
+
+/**
+ * Fold the view after a new message: append its line, and — only once the view
+ * passes `high` — merge the most due pairs in one batch down to `high/2`.
+ *
+ * Never split: the view only appends and coarsens. And never merge a little at
+ * each message: every merge rewrites the view from the merged line on, so a
+ * continuous fold rewrites tens of lines per message while a batch rewrites
+ * about two (measured over 30,000 messages: 21 vs 80 line-inputs per message).
+ */
+export function fit(state: ChatState, high = VIEW): void {
+  const low = Math.max(1, Math.round(high / 2));
   const T = state.messages.length;
   let size = state.view.reduce((acc, part) => acc + partBytes(state, part), 0);
-  while (size > budget) {
-    let best: { at: number; due: number } | undefined;
-    for (let k = 0; k + 1 < state.view.length; k++) {
-      const a = state.view[k]!;
-      const b = state.view[k + 1]!;
-      if (a.l !== b.l || a.i % 2 !== 0 || b.i !== a.i + 1) continue;
+  if (size > high) state.batching = true;
+  if (state.batching) {
+    let changed = false;
+    while (size > low) {
+      let best: { at: number; due: number } | undefined;
+      for (let k = 0; k + 1 < state.view.length; k++) {
+        const a = state.view[k]!;
+        const b = state.view[k + 1]!;
+        if (a.l !== b.l || a.i % 2 !== 0 || b.i !== a.i + 1) continue;
+        const parent: Part = { l: a.l + 1, i: a.i / 2 };
+        if (!built(state, parent.l, parent.i)) continue;
+        const due = pairDue(a, T);
+        if (!best || due > best.due) best = { at: k, due };
+      }
+      if (!best) break; // no parent built yet: merge what we can, on the next call
+      const a = state.view[best.at]!;
+      const before = partBytes(state, a) + partBytes(state, state.view[best.at + 1]!);
       const parent: Part = { l: a.l + 1, i: a.i / 2 };
-      if (!built(state, parent.l, parent.i)) continue;
-      const start = a.i * span(a.l);
-      const due = (T - start) / span(a.l + 2);
-      if (!best || due > best.due) best = { at: k, due };
+      state.view.splice(best.at, 2, parent);
+      size += partBytes(state, parent) - before;
+      changed = true;
     }
-    if (!best) break;
-    const a = state.view[best.at]!;
-    const before = partBytes(state, a) + partBytes(state, state.view[best.at + 1]!);
-    const parent: Part = { l: a.l + 1, i: a.i / 2 };
-    state.view.splice(best.at, 2, parent);
-    size += partBytes(state, parent) - before;
+    if (changed) state.viewDirty = true;
+    if (size <= low) state.batching = false;
   }
   state.viewBytes = size;
 }
@@ -338,8 +481,43 @@ export function pushMessage(state: ChatState, kind: Kind, text: string, date: st
   state.messages.push(msg);
   state.view.push({ l: 0, i: msg.i });
   state.viewBytes += partBytes(state, { l: 0, i: msg.i });
+  enqueue(state, 0, msg.i);
   fit(state, budget);
+  state.viewDirty = true;
   return msg;
+}
+
+/** The view as the plain [l,i] pairs stored in view.json. */
+export function viewPairs(state: ChatState): Array<[number, number]> {
+  return state.view.map((part) => [part.l, part.i] as [number, number]);
+}
+
+/**
+ * Adopt a view read back from view.json.
+ *
+ * Only a view that still tiles [0,T) exactly, with every line a summary, is
+ * usable. Folding the view again from the log picks different merges than the
+ * live fold did (a merge waits for its parent to be built, so timing decides),
+ * and every prompt-cache entry would die with it.
+ */
+export function adoptView(state: ChatState, pairs: unknown): boolean {
+  if (!Array.isArray(pairs) || pairs.length === 0) return false;
+  const view: Part[] = [];
+  let at = 0;
+  for (const pair of pairs) {
+    if (!Array.isArray(pair) || pair.length !== 2) return false;
+    const [l, i] = pair as [unknown, unknown];
+    if (!Number.isInteger(l) || !Number.isInteger(i) || (l as number) < 0 || (i as number) < 0) return false;
+    const [start, stop] = covers(l as number, i as number);
+    if (start !== at) return false;
+    if (nodeText(state, l as number, i as number) === undefined) return false;
+    view.push({ l: l as number, i: i as number });
+    at = stop;
+  }
+  if (at !== state.messages.length) return false;
+  state.view = view;
+  state.viewBytes = view.reduce((acc, part) => acc + partBytes(state, part), 0);
+  return true;
 }
 
 // ------------------------------------------------- the compactor's inputs
@@ -362,25 +540,78 @@ export function stepFor(state: ChatState, l: number, i: number): Step | undefine
   return { kind: "merge", source: [oneLine(a), oneLine(b)] };
 }
 
-export function compactionPrompt(compactPrompt: string, state: ChatState, l: number, i: number): string | undefined {
+/**
+ * The context a compaction call gets: the chat's view up to `end`, merged
+ * further into the COMPACT_LOW..COMPACT_HIGH band.
+ *
+ * A summary needs context to resolve "do it" or "that file", not the whole chat.
+ * It stops at the first line the compactor has not summarized: no call ever
+ * reads a placeholder or half a message.
+ */
+export function compactionLines(state: ChatState, end: number): string[] {
+  let parts: Array<{ l: number; i: number; text: string }> = [];
+  for (const part of state.view) {
+    const [start, stop] = covers(part.l, part.i);
+    if (start >= end || stop > end) break;
+    const text = nodeText(state, part.l, part.i);
+    if (text === undefined) break;
+    parts.push({ l: part.l, i: part.i, text: oneLine(text) });
+  }
+  const sizeOf = (p: { l: number; i: number; text: string }) => byteLen(`${p.i * span(p.l)}+${span(p.l)}|${p.text}`);
+  let size = parts.reduce((acc, p) => acc + sizeOf(p), 0);
+  if (size > COMPACT_HIGH) {
+    while (size > COMPACT_LOW) {
+      let best: { at: number; due: number } | undefined;
+      for (let k = 0; k + 1 < parts.length; k++) {
+        const a = parts[k]!;
+        const b = parts[k + 1]!;
+        if (a.l !== b.l || a.i % 2 !== 0 || b.i !== a.i + 1) continue;
+        if (nodeText(state, a.l + 1, a.i / 2) === undefined) continue;
+        const due = pairDue({ l: a.l, i: a.i }, end);
+        if (!best || due > best.due) best = { at: k, due };
+      }
+      if (!best) break;
+      const a = parts[best.at]!;
+      const b = parts[best.at + 1]!;
+      const merged = { l: a.l + 1, i: a.i / 2, text: oneLine(nodeText(state, a.l + 1, a.i / 2)!) };
+      const before = sizeOf(a) + sizeOf(b);
+      parts.splice(best.at, 2, merged);
+      size += sizeOf(merged) - before;
+    }
+  }
+  return parts.map((p) => `${p.i * span(p.l)}+${span(p.l)}|${p.text}`);
+}
+
+/**
+ * One compaction call. `system` is the SAME prompt a turn carries, so a
+ * compaction is a turn plus a task; then the compaction's own view, then the
+ * task. The task carries ids (the model is told not to write them back) and
+ * shows the size limit as a ruler.
+ */
+export function compactionPrompt(system: string, state: ChatState, l: number, i: number): string | undefined {
   const step = stepFor(state, l, i);
   if (!step) return undefined;
   const end = l === 0 ? i : (i + 1) * span(l);
-  const context = viewLinesUpTo(state, end).join("\n");
-  const body =
+  const start = i * span(l);
+  const half = span(l - 1);
+  const context = compactionLines(state, end).join("\n");
+  const task =
     step.kind === "compress"
-      ? `Compress this message into one line, in at most ${NODE} bytes:\n${step.source[0]}`
-      : `Merge these two lines into one, in at most ${NODE} bytes:\n${step.source[0]}\n${step.source[1]}`;
-  return (
-    `${compactPrompt}\n\n` +
-    `<chat>\n${context}\n</chat>\n\n` +
-    `For scale, this line is exactly ${NODE} bytes:\n${SCALE}\n\n` +
-    body
-  );
+      ? `Compaction: compress message ${i} into one line of at most ${NODE} bytes\n` +
+        `(about 70 words), the length of this ruler:\n${RULER}\n` +
+        `<input>\n${step.source[0]}\n</input>`
+      : `Compaction: merge lines ${start}+${half} and ${start + half}+${half}, adjacent, into one line of at most ${NODE} bytes\n` +
+        `(about 70 words), the length of this ruler:\n${RULER}\n` +
+        `<chat> may hold their messages, ${start} to ${end - 1}, in more detail: take details\n` +
+        `of them from there too.\n` +
+        `<input>\n${step.source[0]}\n${step.source[1]}\n</input>`;
+  return `${system}\n\n<chat>\n${context}\n</chat>\n\n${task}`;
 }
 
 export const SIZE_FEEDBACK = (bytes: number, cut: string): string =>
-  `That line is ${bytes} bytes; the limit is ${NODE}. It must end where it is cut here:\n${cut}| \u2190 LIMIT`;
+  `Too long: your line is ${bytes} bytes, over the ${NODE}-byte limit. Write\n` +
+  `the whole line again for the same <input>, cutting just enough of the\n` +
+  `least valuable items to fit before this cut:\n${cut}| \u2190 LIMIT`;
 
 export function shortest(tries: string[]): string | undefined {
   let best: string | undefined;
@@ -424,10 +655,13 @@ export function signature(msg: IncomingMessage): string {
 }
 
 function cap(text: string, cap = CAP): string {
-  if (byteLen(text) <= cap) return text;
-  const head = cutUtf8(text, Math.floor(cap / 2));
-  const tail = text.slice(-Math.floor(cap / 2));
-  return `${head}\n[... ${byteLen(text) - cap} bytes cut ...]\n${tail}`;
+  const n = charLen(text);
+  if (n <= cap) return text;
+  const half = Math.floor(cap / 2);
+  const chars = [...text];
+  const head = chars.slice(0, half).join("");
+  const tail = chars.slice(n - half).join("");
+  return `${head}\n[... ${n - cap} characters cut ...]\n${tail}`;
 }
 
 function stringify(value: unknown): string {

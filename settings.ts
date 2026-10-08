@@ -24,9 +24,9 @@ export interface Settings {
   orchestrator: boolean;
   /** "provider/model" for the summaries; "" = the model of the session itself */
   compactor: string;
-  /** view budget in bytes */
+  /** view budget in bytes: the mark the view may not pass; a batch then merges it down to half */
   view: number;
-  /** cap applied to one tool result, in bytes */
+  /** cap applied to one tool result, in characters */
   cap: number;
   /** bytes per token, used for the gain estimates in the UI */
   ratio: number;

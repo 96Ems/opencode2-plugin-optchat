@@ -6,8 +6,9 @@ summaries; every turn starts fresh and sees a fixed-size view of the whole chat
 (recent messages one per line, older ones many per line). Details are recovered
 with `zoom`, never by replaying the transcript.
 
-This is the OptChat principle (VictorTaelin, *"OptChat: an endless chat where
-the AI remembers everything"*) implemented as an OpenCode v2 server plugin:
+This is the OptChat principle (VictorTaelin — the recipe's current title is
+*"UniiChat: one chat that never ends"*) implemented as an OpenCode v2 server
+plugin:
 
 - **Infinite context at a constant size.** Nothing is deleted; only the
   resolution of the distant past fades.
@@ -64,7 +65,7 @@ environment variables otherwise — handy since a directory install has no
 
 | option | env | default | meaning |
 |---|---|---|---|
-| `view` | `OPTCHAT_VIEW` | `128000` | view budget in bytes (the recipe's 128 KB: ~500 summary lines) |
+| `view` | `OPTCHAT_VIEW` | `128000` | the mark the view may not pass, in bytes (the recipe's 128 KB: ~500 summary lines). Past it, one batch merges the view down to half |
 | `compactor` | `OPTCHAT_COMPACTOR` | the session's own model | `"provider/model"` for the summaries — pick a cheap (but competent) one |
 | `dataDir` | `OPTCHAT_DATA_DIR` | `$XDG_DATA_HOME/opencode/optchat` | where chats are stored |
 | `enabled` | `OPTCHAT_DISABLED=1` | `true` | set `false` to disable |
@@ -75,6 +76,7 @@ environment variables otherwise — handy since a directory install has no
 <dataDir>/<sessionID>/
   main/YYYY-MM-DD.jsonl   {i,kind,text,size,date,src,inst}   every message, verbatim
   tree/YYYY-MM-DD.jsonl   {l,i,text,size}               one summary line per node
+  view.json               [[l,i], ...]                  the view, as it was left
   optchat.log                                           what the plugin did
   lock                                                  one writer per chat
 ```
@@ -84,6 +86,12 @@ environment variables otherwise — handy since a directory install has no
 system — nothing in this plugin writes it yet. Every line is written with
 one `write` then `fsync`. A torn line (crash mid-write) is reported and skipped
 at load; the log is history and is never edited.
+
+`view.json` is written whenever the view changes and read back at load: the view
+is **kept, not rebuilt**. Folding it again from the log picks different merges
+than the live fold did (a merge waits for its parent to be built, so the timing
+decides), and every prompt-cache entry would die with the rebuilt view. A saved
+view is adopted only while it still tiles the log exactly.
 
 ## TUI plugin — popup and widget
 
@@ -267,10 +275,18 @@ caveat: a subagent costs its own session, so the saving is context and cache, no
    tree nodes does not help either: it re-renders the whole log at that level
    (16, 32, 64 messages per line), so the payload shrinks to a fraction of the
    budget and the recent detail the tiling exists to keep is gone.
-2. **Never split.** The view only appends at the end and coarsens; a pair is
-   merged only when its parent node exists, choosing the most due pair
-   (oldest relative to its size). The start of the view is therefore identical
-   from one turn to the next.
+2. **Never split, and merge in batches.** The view only appends at the end and
+   coarsens. A pair is merged only when its parent node exists, and a pair's age
+   is measured from its **last** message (`due = (T - last) / 2^l`): measuring
+   from its first (`(T - first) / 2^l`) is wrong — checked against the reference
+   push over 4,000 steps, it reproduces it on 275 of them, because near ties it
+   merges old pairs the push keeps, and rewriting an old line costs the whole
+   cached prefix after it. Merges are also held back: one batch fires past
+   `view` and merges down to half of it, so the view is a sawtooth that grows one
+   line per message and drops in one go. Merging a little at every message
+   rewrites tens of view lines per message (measured: 21 vs 80 line-inputs per
+   message over 30,000). The start of the view is identical from one turn to the
+   next either way.
 3. **Only summaries in the view**, never a whole message — a 30 KB tool result
    entering the view would permanently erase old detail.
 4. **Never show cut text silently.** An unsummarized line renders as
@@ -286,12 +302,21 @@ caveat: a subagent costs its own session, so the saving is context and cache, no
    after the hook returned). The turn is therefore never blocked, and the
    compactor catches up during and after the turn — at most the previous turn's
    last reply can appear as a bounded line once.
-5. **Messages are compressed one at a time, in order** (`end <= first`), while
-   merges of finished parts run alongside, up to 8 at once. The compactor never
-   reads a line that is not a summary.
-6. **No ids in the compactor's input** (it copies them into its output), a
-   `SCALE` line of exactly 512 bytes (models can't count bytes), and up to 5
-   tries with the cut-at-limit feedback; the shortest answer is kept.
+5. **Messages are compressed in order**, with up to 8 view lines unsummarized
+   ahead of a node before it may start, while merges of finished parts run
+   alongside (up to 8 calls at once). The compactor never reads a line that is
+   not a summary: a compaction's own view stops at the first unbuilt line. Work
+   comes from a **ready queue** — messages queue themselves as they arrive and a
+   finished node queues its parent — never from a scan of the tree, which is
+   O(N²) over a long chat.
+6. **The compactor gets the same prompt a turn gets**, plus the view as
+   `<chat>`, plus a task that names the ids (`Compaction: compress message 412 …`)
+   and tells the model not to write them back. The size limit is shown as a
+   **ruler of 512 dashes**, never as a real sample line: the model copies the
+   sample's own content into its answer. Up to 5 tries with the cut-at-limit
+   feedback, keeping the shortest answer. A compaction's view is the chat's view
+   merged further, into the 16-32 KB band: a summary needs context to resolve
+   "do it" or "that file", not the whole chat.
 7. **Thoughts are never logged** (the compactor would have to summarize them),
    and tool results are capped at 30,000 characters with a note of what was cut.
 8. **Free nodes**: if the source already fits in 512 bytes it *is* the node, no
@@ -305,9 +330,11 @@ caveat: a subagent costs its own session, so the saving is context and cache, no
 bun test
 ```
 
-71 tests, all pure (no network, no model): `test/core.test.ts` covers byte
-handling, free nodes, in-order compaction, the fold (budget, tiling,
-monotonicity), zoom, prompt assembly, message decomposition and capping;
+79 tests, all pure (no network, no model): `test/core.test.ts` covers byte
+handling, free nodes, the compactor's queue, in-order compaction, the fold
+(budget, one-batch merge, tiling, monotonicity, the merge order against the
+reference push), view.json adoption, the compaction view and prompt, zoom,
+message decomposition and capping;
 `test/settings.test.ts` covers the settings file, the shared dirs, the cost
 model, the bars and the report lines. `bin/measure.ts` prints the same numbers
 for a chat from the command line.
@@ -315,7 +342,7 @@ for a chat from the command line.
 ## License
 
 MIT — see [LICENSE](LICENSE). The design follows VictorTaelin's OptChat spec
-("OptChat: an endless chat where the AI remembers everything").
+("UniiChat: one chat that never ends").
 
 ## Known limits
 
@@ -340,6 +367,15 @@ MIT — see [LICENSE](LICENSE). The design follows VictorTaelin's OptChat spec
 - Sessions are per-chat: each OpenCode session gets its own memory (a subagent
   session gets its own too, which matches OptChat's rule that only the master's
   chat is the memory).
+- **Provider cache breakpoints are not set by the plugin.** The recipe marks the
+  view in 4-line blocks plus the request end (Anthropic's `cache_control`); the
+  plugin has no way to reach into a message part for that, so it relies on the
+  provider's own prefix cache (implicit on OpenAI-style APIs). The view is built
+  to be kind to it: byte-identical system prompt on every call, and a view that
+  only appends and coarsens in batches.
+- The view sits between half the budget and the budget (`view` is the mark, not a
+  target): with the default 128 KB it averages ~96 KB, roughly 25 % less context
+  than the old continuous fold carried.
 - The view budget is a byte count, not tokens: it is what the plugin measures and
   enforces. The UI converts bytes to tokens with the `ratio` setting (1.3 by
   default); the recipe's own measurement of this dense summary text is ≈ 2 bytes

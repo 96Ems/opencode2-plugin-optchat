@@ -185,6 +185,14 @@ export async function loadChatDir(dir: string, budget = 128_000): Promise<Loaded
     transcriptAt[m.i] = transcript;
     viewAt[m.i] = state.viewBytes;
   }
+  // The live view is view.json, when the last session wrote one: adopt it, so the
+  // numbers are the ones the plugin really sends (the fold above is what the
+  // per-message curve needs, and a rebuilt view can differ from the live one).
+  try {
+    C.adoptView(state, JSON.parse(await fs.readFile(join(dir, "view.json"), "utf8")));
+  } catch {
+    /* no saved view: the fold stands */
+  }
 
   const transcriptBytes = transcript;
   return {
